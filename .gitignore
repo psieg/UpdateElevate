@@ -1,0 +1,9 @@
+*.sdf
+*.suo
+*.opensdf
+*.vcxproj.user
+*.vcxproj.filters
+UpdateElevate/Debug/
+UpdateElevate/x64/
+x64/
+private.pem

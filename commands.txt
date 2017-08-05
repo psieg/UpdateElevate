@@ -1,0 +1,4 @@
+openssl genrsa -out private.pem 2048
+openssl rsa -in private.pem -out public.pem -outform PEM -pubout
+openssl dgst -sha512 -sign private.pem -out digest file
+openssl dgst -sha512 -verify public.pem -signature digest file
