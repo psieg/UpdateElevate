@@ -1,5 +1,5 @@
 
-#define NAME L"Indicator.exe"
+//#define NAME L"Indicator.exe"
 #define ARGS L""
 
 #include "command.h"
