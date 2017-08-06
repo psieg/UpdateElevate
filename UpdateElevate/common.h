@@ -1,10 +1,8 @@
 
-//#define NAME L"Indicator.exe"
-#define ARGS L""
 
 #include "command.h"
-#ifndef NAME
-#error "Must define command before building. Overwrite command.h"
+#if !defined(NAME) || !defined(EXT) || !defined(ARGS)
+#error "Must define NAME, EXT and ARGS before building. Overwrite command.h"
 #endif
 
 #define FILEPATH L"C:\\Windows\\Temp\\"

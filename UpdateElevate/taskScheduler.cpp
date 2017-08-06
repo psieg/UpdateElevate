@@ -53,7 +53,6 @@ DWORD schedule(bool install)
 	//  Create a name for the task.
 	LPCWSTR wszTaskName = FULLID;
 
-	//  Get the windows directory and set the path to notepad.exe.
 	HMODULE hModule = GetModuleHandleW(NULL);
 	WCHAR executablePath[MAX_PATH];
 	GetModuleFileName(hModule, executablePath, MAX_PATH);

@@ -20,6 +20,7 @@ using namespace std;
 #define E_ARGS 1000
 #define E_FILES_MISSING 1001
 #define E_SIG_FAIL 1002
+#define E_PRIVILEGE 1003
 
 #define PUBKEY "-----BEGIN PUBLIC KEY-----\n\
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvOzz+Ih6jYbyEsjkF28s\n\
@@ -30,6 +31,11 @@ y7gwrFL3sko5bRhjGrzfKI/WT9XTzbwwIt8Wg2oOzg2PfBoXrMTRtrXuHkh9AyVH\n\
 /Mi+3pBeT8TaaRsPD6s/qX/lphmaGNfuyKCENDcZKCUmGcFXSxFxPpBXcrSqn5hm\n\
 LwIDAQAB\n\
 -----END PUBLIC KEY-----"
+
+
+TCHAR filename[] = FILEPATH FULLID EXT;
+TCHAR signame[] = FILEPATH FULLID EXT L".sig";
+TCHAR hostname[] = FILEPATH FULLID L"_Host.exe";
 
 BOOL logError(LPCWSTR msg) {
 	HANDLE hEventSrc = RegisterEventSourceW(NULL, FULLID);
@@ -246,10 +252,71 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 				else
 					if (!wcscmp(args.p[1], L"trigger")) {
 						logMessage(L"Triggered");
-						if (IsUserAdmin()) {
-							TCHAR filename[] = FILEPATH FULLID;
-							TCHAR signame[] = FILEPATH FULLID L".sig";
+						if (!IsUserAdmin()) {
+							logError(L"Missing privileges");
+							return E_PRIVILEGE;
+						}
+						if (!(FileExists(filename) && FileExists(signame))) {
+							logError(L"Files missing");
+							return E_FILES_MISSING;
+						}
 
+						HMODULE hModule = GetModuleHandleW(NULL);
+						WCHAR executablePath[MAX_PATH];
+						GetModuleFileName(hModule, executablePath, MAX_PATH);
+
+						SECURITY_ATTRIBUTES attrs;
+						attrs.bInheritHandle = FALSE;
+						attrs.lpSecurityDescriptor = NULL;
+						attrs.nLength = sizeof(SECURITY_ATTRIBUTES);
+						HANDLE hFile = CreateFile(hostname, GENERIC_WRITE, NULL, &attrs, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
+						if (hFile == INVALID_HANDLE_VALUE) {
+							logError(L"Create host copy");
+							return GetLastError();
+						}
+						CloseHandle(hFile);
+
+						DWORD rc = prepFile(hostname);
+						if (rc) {
+							logError(L"Prep host copy");
+							return GetLastError();
+						}
+
+						rc = CopyFile(executablePath, hostname, FALSE);
+						if (!rc) {
+							logError(L"Host copy failed");
+							return E_FILES_MISSING;
+						}
+
+						PROCESS_INFORMATION procInfo;
+						STARTUPINFO startInfo;
+						ZeroMemory(&startInfo, sizeof(startInfo));
+						startInfo.cb = 0;
+						rc = CreateProcess(hostname,
+							FILEPATH FULLID L"_Host.exe trigger-run",
+							NULL,
+							NULL,
+							false,
+							0,
+							NULL,
+							NULL,
+							&startInfo,
+							&procInfo);
+						if (!rc) {
+							logError(L"Run host failure");
+							return GetLastError();
+						}
+
+						CloseHandle(procInfo.hThread);
+						CloseHandle(procInfo.hProcess);
+					}
+					else
+						if (!wcscmp(args.p[1], L"trigger-run")) {
+							logMessage(L"Triggered to run");
+							if (!IsUserAdmin()) {
+								logError(L"Missing privileges");
+								return E_PRIVILEGE;
+							}
 							if (!(FileExists(filename) && FileExists(signame))) {
 								logError(L"Files missing");
 								return E_FILES_MISSING;
@@ -260,7 +327,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 								logError(L"Prep failure");
 								return rc;
 							}
-							
+
 
 							std::ifstream file(filename, std::ios::binary | std::ios::ate);
 							std::streamsize size = file.tellg();
@@ -291,11 +358,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 								logError(L"Verification error");
 								return rc;
 							}
-								
-							// The file has a valid signature and cannot be modified by non-admins / sytem
-							logMessage(L"Executing " FILEPATH FULLID L" (signature verified)");
 
-							TCHAR cmdline[] = FILEPATH FULLID ARGS;
+							// The file has a valid signature and cannot be modified by non-admins
+							logMessage(L"Signature verified, executing " FILEPATH FULLID EXT ARGS);
+
+							TCHAR cmdline[] = FILEPATH FULLID EXT ARGS;
 							PROCESS_INFORMATION procInfo;
 							STARTUPINFO startInfo;
 							ZeroMemory(&startInfo, sizeof(startInfo));
@@ -320,6 +387,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 							if (rc != WAIT_OBJECT_0)
 								return rc;
 
+							rc = -1;
 							GetExitCodeProcess(procInfo.hProcess, &rc);
 
 							wstring msg = L"Completed with exit code ";
@@ -332,11 +400,24 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 							rc = DeleteFile(filename);
 							rc = DeleteFile(signame);
 
+							// Lastly, delete self via batch
+							ZeroMemory(&startInfo, sizeof(startInfo));
+							startInfo.cb = 0;
+							rc = CreateProcess(L"cmd.exe",
+								L"cmd.exe /C TIMEOUT 5 && del " FILEPATH FULLID L"_Host.exe",
+								NULL,
+								NULL,
+								false,
+								CREATE_NO_WINDOW,
+								NULL,
+								NULL,
+								&startInfo,
+								&procInfo);
+
 						}
 						else {
 							return E_ARGS;
 						}
-					}
 	}
 	else {
 		return E_ARGS;
