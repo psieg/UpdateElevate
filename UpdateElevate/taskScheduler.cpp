@@ -130,7 +130,7 @@ DWORD schedule(bool install)
 			return 1;
 		}
 
-		hr = pRegInfo->put_Author(L"Author Name");
+		hr = pRegInfo->put_Author( NAME L" (Patrick Siegler)");
 		pRegInfo->Release();  // COM clean up.  Pointer is no longer used.
 		if (FAILED(hr))
 		{
