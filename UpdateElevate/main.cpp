@@ -256,6 +256,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 							std::vector<char> buffer(size);
 							if (!file.read(buffer.data(), size))
 								return 1;
+							file.close();
 
 							std::ifstream sigfile(signame, std::ios::binary | std::ios::ate);
 							std::streamsize sigsize = sigfile.tellg();
@@ -263,6 +264,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 							std::vector<char> sigbuffer(sigsize);
 							if (!sigfile.read(sigbuffer.data(), sigsize))
 								return 1;
+							sigfile.close();
 
 							rc = verifyRSASignature((unsigned char*)buffer.data(), size, (unsigned char*)sigbuffer.data(), (unsigned int)sigsize);
 							if (rc == E_SIG_FAIL)
