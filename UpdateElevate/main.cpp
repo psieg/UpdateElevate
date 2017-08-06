@@ -31,6 +31,13 @@ y7gwrFL3sko5bRhjGrzfKI/WT9XTzbwwIt8Wg2oOzg2PfBoXrMTRtrXuHkh9AyVH\n\
 LwIDAQAB\n\
 -----END PUBLIC KEY-----"
 
+BOOL logError(LPCWSTR msg) {
+	HANDLE hEventSrc = RegisterEventSourceW(NULL, FULLID);
+	BOOL rc = ReportEvent(hEventSrc, EVENTLOG_ERROR_TYPE & 0xFFFF, 0, EVT_ID_LOG, NULL, 1, 0, &msg, NULL);
+	DeregisterEventSource(hEventSrc);
+	return !rc;
+}
+
 BOOL logMessage(LPCWSTR msg) {
 	HANDLE hEventSrc = RegisterEventSourceW(NULL, FULLID);
 	BOOL rc = ReportEvent(hEventSrc, EVENTLOG_INFORMATION_TYPE & 0xFFFF, 0, EVT_ID_LOG, NULL, 1, 0, &msg, NULL);
@@ -238,39 +245,52 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 				}
 				else
 					if (!wcscmp(args.p[1], L"trigger")) {
+						logMessage(L"Triggered");
 						if (IsUserAdmin()) {
 							TCHAR filename[] = FILEPATH FULLID;
 							TCHAR signame[] = FILEPATH FULLID L".sig";
 
-							if (!(FileExists(filename) && FileExists(signame)))
+							if (!(FileExists(filename) && FileExists(signame))) {
+								logError(L"Files missing");
 								return E_FILES_MISSING;
+							}
 
 							DWORD rc = prepFile(filename);
-							if (rc)
+							if (rc) {
+								logError(L"Prep failure");
 								return rc;
+							}
 							
 
 							std::ifstream file(filename, std::ios::binary | std::ios::ate);
 							std::streamsize size = file.tellg();
 							file.seekg(0, std::ios::beg);
 							std::vector<char> buffer(size);
-							if (!file.read(buffer.data(), size))
+							if (!file.read(buffer.data(), size)) {
+								logError(L"File read failure");
 								return 1;
+							}
 							file.close();
 
 							std::ifstream sigfile(signame, std::ios::binary | std::ios::ate);
 							std::streamsize sigsize = sigfile.tellg();
 							sigfile.seekg(0, std::ios::beg);
 							std::vector<char> sigbuffer(sigsize);
-							if (!sigfile.read(sigbuffer.data(), sigsize))
+							if (!sigfile.read(sigbuffer.data(), sigsize)) {
+								logError(L"Sig read failure");
 								return 1;
+							}
 							sigfile.close();
 
 							rc = verifyRSASignature((unsigned char*)buffer.data(), size, (unsigned char*)sigbuffer.data(), (unsigned int)sigsize);
-							if (rc == E_SIG_FAIL)
+							if (rc == E_SIG_FAIL) {
+								logError(L"Invalid signature");
 								return E_SIG_FAIL;
-							else if (rc)
+							}
+							else if (rc) {
+								logError(L"Verification error");
 								return rc;
+							}
 								
 							// The file has a valid signature and cannot be modified by non-admins / sytem
 							logMessage(L"Executing " FILEPATH FULLID L" (signature verified)");
@@ -291,12 +311,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 								NULL,
 								&startInfo,
 								&procInfo);
-							if (!rc)
+							if (!rc) {
+								logError(L"Run failure");
 								return GetLastError();
+							}
 
 							rc = WaitForSingleObject(procInfo.hProcess, INFINITE);
 							if (rc != WAIT_OBJECT_0)
 								return rc;
+
+							GetExitCodeProcess(procInfo.hProcess, &rc);
+
+							wstring msg = L"Completed with exit code ";
+							msg.append(to_wstring(rc));
+							logMessage(msg.c_str());
 
 							CloseHandle(procInfo.hThread);
 							CloseHandle(procInfo.hProcess);
