@@ -4,15 +4,14 @@
 #include <Windows.h>
 #include <AclAPI.h>
 
-
-#include <openssl/pem.h>
-#include <openssl/rsa.h>
-
 #include <string>
 #include <iostream>
 #include <fstream>
 #include <vector>
 using namespace std;
+
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
 
 #include "common.h"
 #include "taskScheduler.h"
@@ -32,11 +31,6 @@ y7gwrFL3sko5bRhjGrzfKI/WT9XTzbwwIt8Wg2oOzg2PfBoXrMTRtrXuHkh9AyVH\n\
 LwIDAQAB\n\
 -----END PUBLIC KEY-----"
 
-
-TCHAR filename[] = FILEPATH FULLID EXT;
-TCHAR signame[] = FILEPATH FULLID EXT L".sig";
-TCHAR hostname[] = FILEPATH FULLID L"_Host.exe";
-
 BOOL logError(LPCWSTR msg) {
 	HANDLE hEventSrc = RegisterEventSourceW(NULL, FULLID);
 	BOOL rc = ReportEvent(hEventSrc, EVENTLOG_ERROR_TYPE & 0xFFFF, 0, EVT_ID_LOG, NULL, 1, 0, &msg, NULL);
@@ -51,10 +45,16 @@ BOOL logMessage(LPCWSTR msg) {
 	return !rc;
 }
 
-
-BOOL send_request() {
+BOOL send_request(LPCWSTR filepath) {
 	HANDLE hEventSrc = RegisterEventSourceW(NULL, FULLID);
-	BOOL rc = ReportEvent(hEventSrc, EVENTLOG_INFORMATION_TYPE & 0xFFFF, 0, EVT_ID_REQUEST, NULL, 0, 0, NULL, NULL);
+	BOOL rc = ReportEvent(hEventSrc, EVENTLOG_INFORMATION_TYPE & 0xFFFF, 0, EVT_ID_REQUEST, NULL, 1, 0, &filepath, NULL);
+	DeregisterEventSource(hEventSrc);
+	return !rc;
+}
+
+BOOL send_completed() {
+	HANDLE hEventSrc = RegisterEventSourceW(NULL, FULLID);
+	BOOL rc = ReportEvent(hEventSrc, EVENTLOG_INFORMATION_TYPE & 0xFFFF, 0, EVT_ID_COMPLETED, NULL, 0, 0, NULL, NULL);
 	DeregisterEventSource(hEventSrc);
 	return !rc;
 }
@@ -98,13 +98,20 @@ DWORD prepFile(const wstring filename) {
 	EXPLICIT_ACCESS eas[2];
 	PACL pACL = 0;
 	DWORD rc;
+	SID_IDENTIFIER_AUTHORITY SIDAuthWorld = SECURITY_WORLD_SID_AUTHORITY;
+	PSID pEveryoneSID = NULL;
+	memset(eas, 0, sizeof(eas));
+	if (!AllocateAndInitializeSid(&SIDAuthWorld, 1,
+		SECURITY_WORLD_RID, 0, 0, 0, 0, 0, 0, 0, &pEveryoneSID)) {
+		return GetLastError();
+	}
 
 	eas[0].grfAccessPermissions = GENERIC_READ | GENERIC_EXECUTE;
 	eas[0].grfAccessMode = GRANT_ACCESS;
 	eas[0].grfInheritance = NO_INHERITANCE;
-	eas[0].Trustee.TrusteeForm = TRUSTEE_IS_NAME;
+	eas[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
 	eas[0].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
-	eas[0].Trustee.ptstrName = L"EVERYONE";
+	eas[0].Trustee.ptstrName = (LPTSTR)pEveryoneSID;
 
 	eas[1].grfAccessPermissions = GENERIC_ALL;
 	eas[1].grfAccessMode = GRANT_ACCESS;
@@ -116,14 +123,20 @@ DWORD prepFile(const wstring filename) {
 	rc = SetEntriesInAcl(2, &eas[0], NULL, &pACL);
 	if (rc != ERROR_SUCCESS)
 	{
-		printf("SetEntriesInAcl: %u\n", rc);
+		//wstring msg = L"entries" + std::to_wstring(rc);
+		//logError(msg.c_str());
+		//printf("SetEntriesInAcl: %u\n", rc);
 		return rc;
 	}
 
 	TCHAR namebuf[40];
 	DWORD bufs = 40;
 	rc = GetUserName(namebuf, &bufs);
-	if (!rc) return GetLastError();
+	if (!rc) {
+		//wstring msg = L"name" + std::to_wstring(rc);
+		//logError(msg.c_str());
+		return GetLastError();
+	}
 
 	BYTE sidbuf[1024];
 	bufs = 1024;
@@ -131,7 +144,11 @@ DWORD prepFile(const wstring filename) {
 	DWORD bufs2 = 1024;
 	SID_NAME_USE snu;
 	rc = LookupAccountName(NULL, namebuf, sidbuf, &bufs, sidbuf2, &bufs2, &snu);
-	if (!rc) return GetLastError();
+	if (!rc){
+		//wstring msg = L"lookup" + std::to_wstring(rc);
+		//logError(msg.c_str());
+		return GetLastError();
+	}
 
 	rc = SetNamedSecurityInfo((LPTSTR)filename.c_str(), SE_FILE_OBJECT,
 		OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
@@ -213,7 +230,7 @@ DWORD verifyRSASignature(unsigned char *originalMessage, std::streamsize om_leng
 
 	rc = SHA512_Final(digest, &sha_ctx);
 	if (1 != rc) return 1;
-	
+
 	result = RSA_verify(NID_sha512, digest, SHA512_DIGEST_LENGTH,
 		signature, siglen, rsa_pubkey);
 
@@ -240,186 +257,241 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 	if (args.n > 1) {
 		if (!wcscmp(args.p[1], L"install")) {
 			return schedule(true);
-		}
-		else
-			if (!wcscmp(args.p[1], L"uninstall")) {
-				return schedule(false);
-			}
-			else
-				if (!wcscmp(args.p[1], L"request")) {
-					return send_request();
-				}
-				else
-					if (!wcscmp(args.p[1], L"trigger")) {
-						logMessage(L"Triggered");
-						if (!IsUserAdmin()) {
-							logError(L"Missing privileges");
-							return E_PRIVILEGE;
-						}
-						if (!(FileExists(filename) && FileExists(signame))) {
-							logError(L"Files missing");
-							return E_FILES_MISSING;
-						}
-
-						HMODULE hModule = GetModuleHandleW(NULL);
-						WCHAR executablePath[MAX_PATH];
-						GetModuleFileName(hModule, executablePath, MAX_PATH);
-
-						SECURITY_ATTRIBUTES attrs;
-						attrs.bInheritHandle = FALSE;
-						attrs.lpSecurityDescriptor = NULL;
-						attrs.nLength = sizeof(SECURITY_ATTRIBUTES);
-						HANDLE hFile = CreateFile(hostname, GENERIC_WRITE, NULL, &attrs, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
-						if (hFile == INVALID_HANDLE_VALUE) {
-							logError(L"Create host copy");
-							return GetLastError();
-						}
-						CloseHandle(hFile);
-
-						DWORD rc = prepFile(hostname);
-						if (rc) {
-							logError(L"Prep host copy");
-							return GetLastError();
-						}
-
-						rc = CopyFile(executablePath, hostname, FALSE);
-						if (!rc) {
-							logError(L"Host copy failed");
-							return E_FILES_MISSING;
-						}
-
-						PROCESS_INFORMATION procInfo;
-						STARTUPINFO startInfo;
-						ZeroMemory(&startInfo, sizeof(startInfo));
-						startInfo.cb = 0;
-						rc = CreateProcess(hostname,
-							FILEPATH FULLID L"_Host.exe trigger-run",
-							NULL,
-							NULL,
-							false,
-							0,
-							NULL,
-							NULL,
-							&startInfo,
-							&procInfo);
-						if (!rc) {
-							logError(L"Run host failure");
-							return GetLastError();
-						}
-
-						CloseHandle(procInfo.hThread);
-						CloseHandle(procInfo.hProcess);
+		} else if (!wcscmp(args.p[1], L"uninstall")) {
+			return schedule(false);
+		} else if (!wcscmp(args.p[1], L"request")) {
+			if (args.n > 2) {
+				if (args.n > 3) {
+					wstring cmdline = args.p[3];
+					for (int i = 4; i < args.n; i++) {
+						cmdline.append(L" ");
+						cmdline.append(args.p[i]);
 					}
-					else
-						if (!wcscmp(args.p[1], L"trigger-run")) {
-							logMessage(L"Triggered to run");
-							if (!IsUserAdmin()) {
-								logError(L"Missing privileges");
-								return E_PRIVILEGE;
-							}
-							if (!(FileExists(filename) && FileExists(signame))) {
-								logError(L"Files missing");
-								return E_FILES_MISSING;
-							}
+					if (schedule_cb(true, cmdline))
+						logError(L"schedule callback");
+				} else {
+					DWORD rc = schedule_cb(false, L"");
+				}
+				return send_request(args.p[2]);
+			} else {
+				return E_ARGS;
+			}
+		} else if (!wcscmp(args.p[1], L"trigger") || !wcscmp(args.p[1], L"trigger-run")) {
+			if (!IsUserAdmin()) {
+				logError(L"Missing privileges");
+				return E_PRIVILEGE;
+			}
 
-							DWORD rc = prepFile(filename);
-							if (rc) {
-								logError(L"Prep failure");
-								return rc;
-							}
+			if (args.n <= 2) {
+				logError(L"Missing path argument");
+				return E_ARGS;
+			}
+			wstring wd = args.p[2];
+			if (wd[wd.length() - 1] != '\\')
+				wd.append(L"\\");
+			wstring filename = wd + FULLID EXT;
+			wstring signame = wd + FULLID EXT L".sig";
+			wstring hostname = HOSTPATH FULLID L"_Host.exe";
 
+			if (!(FileExists(filename.c_str()) && FileExists(signame.c_str()))) {
+				logError(L"Files missing");
+				return E_FILES_MISSING;
+			}
 
-							std::ifstream file(filename, std::ios::binary | std::ios::ate);
-							std::streamsize size = file.tellg();
-							file.seekg(0, std::ios::beg);
-							std::vector<char> buffer(size);
-							if (!file.read(buffer.data(), size)) {
-								logError(L"File read failure");
-								return 1;
-							}
-							file.close();
+			if (!wcscmp(args.p[1], L"trigger")) {
+				logMessage(L"Triggered");
 
-							std::ifstream sigfile(signame, std::ios::binary | std::ios::ate);
-							std::streamsize sigsize = sigfile.tellg();
-							sigfile.seekg(0, std::ios::beg);
-							std::vector<char> sigbuffer(sigsize);
-							if (!sigfile.read(sigbuffer.data(), sigsize)) {
-								logError(L"Sig read failure");
-								return 1;
-							}
-							sigfile.close();
+				HMODULE hModule = GetModuleHandleW(NULL);
+				WCHAR executablePath[MAX_PATH];
+				GetModuleFileName(hModule, executablePath, MAX_PATH);
 
-							rc = verifyRSASignature((unsigned char*)buffer.data(), size, (unsigned char*)sigbuffer.data(), (unsigned int)sigsize);
-							if (rc == E_SIG_FAIL) {
-								logError(L"Invalid signature");
-								return E_SIG_FAIL;
-							}
-							else if (rc) {
-								logError(L"Verification error");
-								return rc;
-							}
+				SECURITY_ATTRIBUTES attrs;
+				attrs.bInheritHandle = FALSE;
+				attrs.lpSecurityDescriptor = NULL;
+				attrs.nLength = sizeof(SECURITY_ATTRIBUTES);
+				HANDLE hFile = CreateFile(hostname.c_str(), GENERIC_WRITE, NULL, &attrs, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
+				if (hFile == INVALID_HANDLE_VALUE) {
+					logError(L"Create host copy failed");
+					return GetLastError();
+				}
+				CloseHandle(hFile);
 
-							// The file has a valid signature and cannot be modified by non-admins
-							logMessage(L"Signature verified, executing " FILEPATH FULLID EXT ARGS);
+				DWORD rc = prepFile(hostname);
+				if (rc) {
+					logError(L"prep host copy failed");
+					return GetLastError();
+				}
 
-							TCHAR cmdline[] = FILEPATH FULLID EXT ARGS;
-							PROCESS_INFORMATION procInfo;
-							STARTUPINFO startInfo;
-							ZeroMemory(&startInfo, sizeof(startInfo));
-							startInfo.cb = 0;
+				rc = CopyFile(executablePath, hostname.c_str(), FALSE);
+				if (!rc) {
+					logError(L"copy host copy failed");
+					return E_FILES_MISSING;
+				}
 
-							rc = CreateProcess(filename,
-								cmdline,
-								NULL,
-								NULL,
-								false,
-								0,
-								NULL,
-								NULL,
-								&startInfo,
-								&procInfo);
-							if (!rc) {
-								logError(L"Run failure");
-								return GetLastError();
-							}
+				PROCESS_INFORMATION procInfo;
+				STARTUPINFO startInfo;
+				ZeroMemory(&startInfo, sizeof(startInfo));
+				startInfo.cb = 0;
+				wstring cmdline = HOSTPATH FULLID L"_Host.exe trigger-run " + wd;
+				std::vector<wchar_t> cmdvec(cmdline.begin(), cmdline.end());
+				cmdvec.push_back(L'\0');
+				rc = CreateProcess(hostname.c_str(),
+					cmdvec.data(),
+					NULL,
+					NULL,
+					false,
+					0,
+					NULL,
+					NULL,
+					&startInfo,
+					&procInfo);
+				if (!rc) {
+					logError(L"Run host failure");
+					return GetLastError();
+				}
 
-							rc = WaitForSingleObject(procInfo.hProcess, INFINITE);
-							if (rc != WAIT_OBJECT_0)
-								return rc;
+				CloseHandle(procInfo.hThread);
+				CloseHandle(procInfo.hProcess);
+			} else { // == "trigger-run"
+				logMessage(L"Triggered to run");
 
-							rc = -1;
-							GetExitCodeProcess(procInfo.hProcess, &rc);
+				DWORD rc = prepFile(filename);
+				if (rc) {
+					logError(L"Prep failure");
+					return rc;
+				}
 
-							wstring msg = L"Completed with exit code ";
-							msg.append(to_wstring(rc));
-							logMessage(msg.c_str());
+				std::ifstream file(filename, std::ios::binary | std::ios::ate);
+				std::streamsize size = file.tellg();
+				file.seekg(0, std::ios::beg);
+				std::vector<char> buffer(size);
+				if (!file.read(buffer.data(), size)) {
+					logError(L"File read failure");
+					return 1;
+				}
+				file.close();
 
-							CloseHandle(procInfo.hThread);
-							CloseHandle(procInfo.hProcess);
+				std::ifstream sigfile(signame, std::ios::binary | std::ios::ate);
+				std::streamsize sigsize = sigfile.tellg();
+				sigfile.seekg(0, std::ios::beg);
+				std::vector<char> sigbuffer(sigsize);
+				if (!sigfile.read(sigbuffer.data(), sigsize)) {
+					logError(L"Sig read failure");
+					return 1;
+				}
+				sigfile.close();
 
-							rc = DeleteFile(filename);
-							rc = DeleteFile(signame);
+				rc = verifyRSASignature((unsigned char*)buffer.data(), size, (unsigned char*)sigbuffer.data(), (unsigned int)sigsize);
+				if (rc == E_SIG_FAIL) {
+					logError(L"Invalid signature");
+					return E_SIG_FAIL;
+				} else if (rc) {
+					logError(L"Verification error");
+					return rc;
+				}
 
-							// Lastly, delete self via batch
-							ZeroMemory(&startInfo, sizeof(startInfo));
-							startInfo.cb = 0;
-							rc = CreateProcess(L"cmd.exe",
-								L"cmd.exe /C TIMEOUT 5 && del " FILEPATH FULLID L"_Host.exe",
-								NULL,
-								NULL,
-								false,
-								CREATE_NO_WINDOW,
-								NULL,
-								NULL,
-								&startInfo,
-								&procInfo);
+				// The file has a valid signature and cannot be modified by non-admins
+				wstring cmdline = filename + L" " + ARGS;
+				std::vector<wchar_t> cmdvec(cmdline.begin(), cmdline.end());
+				cmdvec.push_back(L'\0');
 
-						}
-						else {
-							return E_ARGS;
-						}
-	}
-	else {
+				wstring logmsg = L"Signature verified, executing ";
+				logmsg.append(cmdline);
+				logMessage(logmsg.c_str());
+
+				PROCESS_INFORMATION procInfo;
+				STARTUPINFO startInfo;
+				ZeroMemory(&startInfo, sizeof(startInfo));
+				startInfo.cb = 0;
+
+				rc = CreateProcess(NULL,
+					cmdvec.data(),
+					NULL,
+					NULL,
+					false,
+					0,
+					NULL,
+					NULL,
+					&startInfo,
+					&procInfo);
+				if (!rc) {
+					logError(L"Run failure");
+					return GetLastError();
+				}
+
+				rc = WaitForSingleObject(procInfo.hProcess, INFINITE);
+				if (rc != WAIT_OBJECT_0)
+					return rc;
+
+				rc = -1;
+				GetExitCodeProcess(procInfo.hProcess, &rc);
+
+				wstring msg = L"Completed with exit code ";
+				msg.append(to_wstring(rc));
+				logMessage(msg.c_str());
+				send_completed();
+
+				CloseHandle(procInfo.hThread);
+				CloseHandle(procInfo.hProcess);
+
+				rc = DeleteFile(filename.c_str());
+				rc = DeleteFile(signame.c_str());
+
+				// Lastly, delete self via batch
+				ZeroMemory(&startInfo, sizeof(startInfo));
+				startInfo.cb = 0;
+				cmdline = L"cmd.exe /C TIMEOUT 5 && del " + hostname;
+				cmdvec.assign(cmdline.begin(), cmdline.end());
+				cmdvec.push_back(L'\0');
+				rc = CreateProcess(L"cmd.exe",
+					cmdvec.data(),
+					NULL,
+					NULL,
+					false,
+					CREATE_NO_WINDOW,
+					NULL,
+					NULL,
+					&startInfo,
+					&procInfo);
+			}
+		} else if (!wcscmp(args.p[1], L"completed")) {
+			schedule_cb(false, L"");
+
+			if (args.n > 2) {
+				wstring cmdline = args.p[2];
+				for (int i = 3; i < args.n; i++) {
+					cmdline.append(L" ");
+					cmdline.append(args.p[i]);
+				}
+				std::vector<wchar_t> cmdvec(cmdline.begin(), cmdline.end());
+				cmdvec.push_back(L'\0');
+
+				PROCESS_INFORMATION procInfo;
+				STARTUPINFO startInfo;
+				ZeroMemory(&startInfo, sizeof(startInfo));
+				startInfo.cb = 0;
+
+				DWORD rc = CreateProcess(NULL,
+					&cmdvec[0],
+					NULL,
+					NULL,
+					false,
+					0,
+					NULL,
+					NULL,
+					&startInfo,
+					&procInfo);
+				if (!rc) {
+					logError(L"Run failure");
+					return GetLastError();
+				}
+			} else {
+				return E_ARGS;
+			}
+		} else {
+			return E_ARGS;
+		}
+	} else {
 		return E_ARGS;
 	}
 

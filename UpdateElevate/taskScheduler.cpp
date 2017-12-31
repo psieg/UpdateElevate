@@ -6,6 +6,7 @@ This sample schedules a task to start on a weekly basis.
 ********************************************************************/
 #include <Sddl.h>
 
+#include <ctime>
 #include <iostream>
 #include <stdio.h>
 #include <comdef.h>
@@ -18,8 +19,29 @@ This sample schedules a task to start on a weekly basis.
 
 using namespace std;
 
+DWORD schedule(bool install, bool elevate, BSTR name, BSTR condition, BSTR arg);
 
-DWORD schedule(bool install)
+DWORD schedule(bool install) {
+
+	BSTR query = L"<QueryList><Query Id=\"0\" Path=\"Application\"><Select Path=\"Application\">*[System[Provider[@Name='" FULLID L"'] and EventID=" EVT_ID_REQUEST_S L"]]</Select></Query></QueryList>";
+
+	WCHAR args[] = L"trigger $(pkgPath)";
+
+	return schedule(install, true, FULLID, query, args);
+}
+
+DWORD schedule_cb(bool install, const wstring& callback) {
+
+	BSTR query = L"<QueryList><Query Id=\"0\" Path=\"Application\"><Select Path=\"Application\">*[System[Provider[@Name='" FULLID L"'] and EventID=" EVT_ID_COMPLETED_S L"]]</Select></Query></QueryList>";
+
+	wstring args = L"completed ";
+	args.append(callback);
+	_bstr_t bargs = args.c_str();
+
+	return schedule(install, false, FULLIDCB, query, bargs);
+}
+
+DWORD schedule(bool install, bool elevate, BSTR name, BSTR condition, BSTR args)
 {
 	//  ------------------------------------------------------
 	//  Initialize COM.
@@ -51,12 +73,6 @@ DWORD schedule(bool install)
 
 	//  ------------------------------------------------------
 	//  Create a name for the task.
-	LPCWSTR wszTaskName = FULLID;
-
-	HMODULE hModule = GetModuleHandleW(NULL);
-	WCHAR executablePath[MAX_PATH];
-	GetModuleFileName(hModule, executablePath, MAX_PATH);
-	WCHAR arg[] = L"trigger";
 
 
 	//  ------------------------------------------------------
@@ -99,7 +115,7 @@ DWORD schedule(bool install)
 	}
 
 	//  If the same task exists, remove it.
-	pRootFolder->DeleteTask(_bstr_t(wszTaskName), 0);
+	pRootFolder->DeleteTask(name, 0);
 
 	if (install) {
 
@@ -129,7 +145,7 @@ DWORD schedule(bool install)
 			return 1;
 		}
 
-		hr = pRegInfo->put_Author( NAME L" (Patrick Siegler)");
+		hr = pRegInfo->put_Author( NAME L" (Automatic Updater)");
 		pRegInfo->Release();  // COM clean up.  Pointer is no longer used.
 		if (FAILED(hr))
 		{
@@ -162,19 +178,20 @@ DWORD schedule(bool install)
 
 		//  ------------------------------------------------------
 		//  Set the task to run elevated
+		if (elevate) {
 
-		IPrincipal *pPrincipal;
-		hr = pTask->get_Principal(&pPrincipal);
-		if (FAILED(hr))
-		{
-			pRootFolder->Release();
-			pTask->Release();
-			CoUninitialize();
-			return 1;
+			IPrincipal *pPrincipal;
+			hr = pTask->get_Principal(&pPrincipal);
+			if (FAILED(hr))
+			{
+				pRootFolder->Release();
+				pTask->Release();
+				CoUninitialize();
+				return 1;
+			}
+
+			pPrincipal->put_RunLevel(TASK_RUNLEVEL_HIGHEST);
 		}
-
-		pPrincipal->put_RunLevel(TASK_RUNLEVEL_HIGHEST);
-
 
 		//  ------------------------------------------------------
 		//  Get the trigger collection to insert the weekly trigger.
@@ -213,9 +230,61 @@ DWORD schedule(bool install)
 			return 1;
 		}
 
-		PCWSTR query = L"<QueryList><Query Id=\"0\" Path=\"Application\"><Select Path=\"Application\">*[System[Provider[@Name='" FULLID L"'] and EventID=" EVT_ID_REQUEST_S L"]]</Select></Query></QueryList>";
+		hr = pEventTrigger->put_Subscription(condition);
+		if (FAILED(hr))
+		{
+			pEventTrigger->Release();
+			pRootFolder->Release();
+			pTask->Release();
+			CoUninitialize();
+			return 1;
+		}
 
-		hr = pEventTrigger->put_Subscription(_bstr_t(query));
+		if (!elevate) {
+			time_t now;
+			time(&now);
+			now += 60 * 10;
+			char buf[sizeof "2011-10-08T07:07:09Z"];
+			tm expiry;
+			DWORD rc = gmtime_s(&expiry, &now);
+			strftime(buf, sizeof buf, "%Y-%m-%dT%H:%M:%SZ", &expiry);
+
+			hr = pEventTrigger->put_EndBoundary(_bstr_t(buf));
+			if (FAILED(hr))
+			{
+				pEventTrigger->Release();
+				pRootFolder->Release();
+				pTask->Release();
+				CoUninitialize();
+				return 1;
+			}
+		}
+
+		ITaskNamedValueCollection *pCollection = NULL;
+		hr = pEventTrigger->get_ValueQueries(&pCollection);
+		if (FAILED(hr))
+		{
+			pEventTrigger->Release();
+			pRootFolder->Release();
+			pTask->Release();
+			CoUninitialize();
+			return 1;
+		}
+
+		ITaskNamedValuePair *pPair = NULL;
+		pCollection->Create(L"pkgPath", L"Event/EventData/Data", &pPair);
+		if (FAILED(hr))
+		{
+			pCollection->Release();
+			pEventTrigger->Release();
+			pRootFolder->Release();
+			pTask->Release();
+			CoUninitialize();
+			return 1;
+		}
+
+		pPair->Release();
+		pCollection->Release();
 		pEventTrigger->Release();
 
 		//  ------------------------------------------------------
@@ -257,8 +326,11 @@ DWORD schedule(bool install)
 			return 1;
 		}
 
-		//  Set the path of the executable to notepad.exe.
-		hr = pExecAction->put_Path(_bstr_t(executablePath));
+		//  Set the path of the executable to self.
+		HMODULE hModule = GetModuleHandleW(NULL);
+		WCHAR executablePath[MAX_PATH];
+		GetModuleFileName(hModule, executablePath, MAX_PATH);
+		hr = pExecAction->put_Path(executablePath);
 		if (FAILED(hr))
 		{
 			pRootFolder->Release();
@@ -267,8 +339,8 @@ DWORD schedule(bool install)
 			return 1;
 		}
 
-		//  Set the path of the executable to notepad.exe.
-		hr = pExecAction->put_Arguments(_bstr_t(arg));
+		//  Set the args.
+		hr = pExecAction->put_Arguments(args);
 		pExecAction->Release();
 		if (FAILED(hr))
 		{
@@ -289,12 +361,12 @@ DWORD schedule(bool install)
 
 		IRegisteredTask *pRegisteredTask = NULL;
 		hr = pRootFolder->RegisterTaskDefinition(
-			_bstr_t(wszTaskName),
+			name,
 			pTask,
 			TASK_CREATE_OR_UPDATE,
-			_variant_t(_bstr_t(L"S-1-5-18")), // SYSTEM account
+			elevate ? _variant_t(_bstr_t(L"S-1-5-18")) : varnull, // SYSTEM account
 			varnull,
-			TASK_LOGON_SERVICE_ACCOUNT,
+			TASK_LOGON_INTERACTIVE_TOKEN,
 			_variant_t(L""),
 			&pRegisteredTask);
 		if (FAILED(hr))
