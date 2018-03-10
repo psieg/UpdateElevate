@@ -262,7 +262,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 		} else if (!wcscmp(args.p[1], L"request")) {
 			if (args.n > 2) {
 				if (args.n > 3) {
-					wstring cmdline = args.p[3];
+					wstring cmdline = L"\"";
+					cmdline.append(args.p[3]);
+					cmdline.append(L"\"");
 					for (int i = 4; i < args.n; i++) {
 						cmdline.append(L" ");
 						cmdline.append(args.p[i]);
@@ -458,7 +460,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 			schedule_cb(false, L"");
 
 			if (args.n > 2) {
-				wstring cmdline = args.p[2];
+				wstring cmdline = L"\"";
+				cmdline.append(args.p[2]);
+				cmdline.append(L"\"");
 				for (int i = 3; i < args.n; i++) {
 					cmdline.append(L" ");
 					cmdline.append(args.p[i]);
