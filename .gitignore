@@ -3,6 +3,7 @@
 *.opensdf
 *.vcxproj.user
 *.vcxproj.filters
+.vs
 UpdateElevate/Debug/
 UpdateElevate/x64/
 x64/
