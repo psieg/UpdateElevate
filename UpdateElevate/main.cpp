@@ -94,7 +94,7 @@ bool FileExists(const TCHAR *fileName)
 	return true;
 }
 
-DWORD prepFile(const wstring filename) {
+DWORD prepFile(const wstring& filename) {
 	EXPLICIT_ACCESS eas[2];
 	PACL pACL = 0;
 	DWORD rc;
@@ -154,42 +154,6 @@ DWORD prepFile(const wstring filename) {
 		OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
 		sidbuf, NULL, pACL, NULL);
 	if (rc) return rc;
-	/*
-	SECURITY_DESCRIPTOR desc;
-	rc = InitializeSecurityDescriptor(&desc, SECURITY_DESCRIPTOR_REVISION);
-	if (!rc)
-	{
-	return INVALID_HANDLE_VALUE;
-	}
-
-	rc = SetSecurityDescriptorDacl(&desc, TRUE, pACL, FALSE);
-	if (!rc)
-	{
-	return INVALID_HANDLE_VALUE;
-	}
-
-	SECURITY_ATTRIBUTES attrs;
-	attrs.bInheritHandle = FALSE;
-	attrs.lpSecurityDescriptor = &desc;
-	attrs.nLength = sizeof(SECURITY_ATTRIBUTES);
-	HANDLE hFile = CreateFile(filename.c_str(), GENERIC_ALL, FILE_SHARE_READ, &attrs, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
-	if (hFile == INVALID_HANDLE_VALUE) {
-	return INVALID_HANDLE_VALUE;
-	}
-
-	rc = SetSecurityInfo(hFile, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, NULL, NULL, pACL, NULL);
-	if (rc != ERROR_SUCCESS) {
-	return INVALID_HANDLE_VALUE;
-	}
-
-	const WCHAR* buf = L"protected";
-	int rc = WriteFile(hFile, buf, sizeof(TCHAR)*9, NULL, NULL);
-	if (!rc)
-	return 1;
-
-	CloseHandle(hFile);
-
-	*/
 
 	// because these files are now hard to remove, schedule them for deletion upon reboot (we might fail to delete it in case of errors)
 #ifdef _DEBUG
@@ -202,6 +166,33 @@ DWORD prepFile(const wstring filename) {
 #endif
 
 	LocalFree(pACL);
+
+	return 0;
+}
+
+DWORD copyAndPrepFile(const wstring& src, const wstring& dest) {
+	SECURITY_ATTRIBUTES attrs;
+	attrs.bInheritHandle = FALSE;
+	attrs.lpSecurityDescriptor = NULL;
+	attrs.nLength = sizeof(SECURITY_ATTRIBUTES);
+	HANDLE hFile = CreateFile(dest.c_str(), GENERIC_WRITE, NULL, &attrs, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
+	if (hFile == INVALID_HANDLE_VALUE) {
+		logError(L"Create host copy failed");
+		return GetLastError();
+	}
+	CloseHandle(hFile);
+
+	DWORD rc = prepFile(dest);
+	if (rc) {
+		logError(L"prep host copy failed");
+		return GetLastError();
+	}
+
+	rc = CopyFile(src.c_str(), dest.c_str(), FALSE);
+	if (!rc) {
+		logError(L"copy host copy failed");
+		return E_FILES_MISSING;
+	}
 
 	return 0;
 }
@@ -253,6 +244,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 	};
 
 	Args    args;
+	DWORD	rc;
 
 	if (args.n > 1) {
 		if (!wcscmp(args.p[1], L"install")) {
@@ -272,7 +264,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 					if (schedule_cb(true, cmdline))
 						logError(L"schedule callback");
 				} else {
-					DWORD rc = schedule_cb(false, L"");
+					rc = schedule_cb(false, L"");
 				}
 				return send_request(args.p[2]);
 			} else {
@@ -291,11 +283,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 			wstring wd = args.p[2];
 			if (wd[wd.length() - 1] != '\\')
 				wd.append(L"\\");
-			wstring filename = wd + FULLID EXT;
+			wstring pkgname = wd + FULLID EXT;
 			wstring signame = wd + FULLID EXT L".sig";
-			wstring hostname = HOSTPATH FULLID L"_Host.exe";
+			wstring hostDir = HOSTPATH FULLID;
 
-			if (!(FileExists(filename.c_str()) && FileExists(signame.c_str()))) {
+			if (!(FileExists(pkgname.c_str()) && FileExists(signame.c_str()))) {
 				logError(L"Files missing");
 				return E_FILES_MISSING;
 			}
@@ -307,37 +299,39 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 				WCHAR executablePath[MAX_PATH];
 				GetModuleFileName(hModule, executablePath, MAX_PATH);
 
-				SECURITY_ATTRIBUTES attrs;
-				attrs.bInheritHandle = FALSE;
-				attrs.lpSecurityDescriptor = NULL;
-				attrs.nLength = sizeof(SECURITY_ATTRIBUTES);
-				HANDLE hFile = CreateFile(hostname.c_str(), GENERIC_WRITE, NULL, &attrs, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
-				if (hFile == INVALID_HANDLE_VALUE) {
-					logError(L"Create host copy failed");
-					return GetLastError();
-				}
-				CloseHandle(hFile);
+				wstring executableDir(executablePath);
+				executableDir.erase(executableDir.find_last_of('\\') + 1, string::npos);
 
-				DWORD rc = prepFile(hostname);
-				if (rc) {
-					logError(L"prep host copy failed");
-					return GetLastError();
-				}
-
-				rc = CopyFile(executablePath, hostname.c_str(), FALSE);
+				rc = CreateDirectory(hostDir.c_str(), NULL);
 				if (!rc) {
-					logError(L"copy host copy failed");
-					return E_FILES_MISSING;
+					if (GetLastError() != ERROR_ALREADY_EXISTS) {
+						logError(L"Host dir creation failure");
+						return GetLastError();
+					}
+				}
+				rc = prepFile(hostDir);
+				if (rc) {
+					logError(L"Host dir prep failure");
+					return rc;
+				}
+
+				for (const WCHAR* fileName : {L"UpdateElevate.exe", L"libssl-1_1-x64.dll", L"libcrypto-1_1-x64.dll" , L"vcruntime140.dll", L"msvcp140.dll" }) {
+					rc = copyAndPrepFile(executableDir + fileName, hostDir + L"\\" + fileName);
+					if (rc) {
+						logError(L"Run host failure");
+						return rc;
+					}
 				}
 
 				PROCESS_INFORMATION procInfo;
 				STARTUPINFO startInfo;
 				ZeroMemory(&startInfo, sizeof(startInfo));
 				startInfo.cb = 0;
-				wstring cmdline = HOSTPATH FULLID L"_Host.exe trigger-run " + wd;
+				wstring hostPath = hostDir + L"\\UpdateElevate.exe";
+				wstring cmdline = hostPath + L" trigger-run " + wd;
 				std::vector<wchar_t> cmdvec(cmdline.begin(), cmdline.end());
 				cmdvec.push_back(L'\0');
-				rc = CreateProcess(hostname.c_str(),
+				rc = CreateProcess(hostPath.c_str(),
 					cmdvec.data(),
 					NULL,
 					NULL,
@@ -357,13 +351,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 			} else { // == "trigger-run"
 				logMessage(L"Triggered to run");
 
-				DWORD rc = prepFile(filename);
+				DWORD rc = prepFile(pkgname);
 				if (rc) {
 					logError(L"Prep failure");
 					return rc;
 				}
 
-				std::ifstream file(filename, std::ios::binary | std::ios::ate);
+				std::ifstream file(pkgname, std::ios::binary | std::ios::ate);
 				std::streamsize size = file.tellg();
 				file.seekg(0, std::ios::beg);
 				std::vector<char> buffer(size);
@@ -393,7 +387,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 				}
 
 				// The file has a valid signature and cannot be modified by non-admins
-				wstring cmdline = filename + L" " + ARGS;
+				wstring cmdline = pkgname + L" " + ARGS;
 				std::vector<wchar_t> cmdvec(cmdline.begin(), cmdline.end());
 				cmdvec.push_back(L'\0');
 
@@ -436,16 +430,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 				CloseHandle(procInfo.hThread);
 				CloseHandle(procInfo.hProcess);
 
-				rc = DeleteFile(filename.c_str());
+				rc = DeleteFile(pkgname.c_str());
 				rc = DeleteFile(signame.c_str());
 
 				// Lastly, delete self via batch
 				ZeroMemory(&startInfo, sizeof(startInfo));
 				startInfo.cb = 0;
-				cmdline = L"cmd.exe /C TIMEOUT 5 && del " + hostname;
+				cmdline = L"cmd.exe /C TIMEOUT 5 && rmdir /S /Q " + hostDir;
 				cmdvec.assign(cmdline.begin(), cmdline.end());
 				cmdvec.push_back(L'\0');
-				rc = CreateProcess(L"cmd.exe",
+				rc = CreateProcess(L"C:\\Windows\\system32\\cmd.exe",
 					cmdvec.data(),
 					NULL,
 					NULL,
