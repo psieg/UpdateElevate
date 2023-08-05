@@ -10,8 +10,9 @@
 #include <vector>
 using namespace std;
 
-#include <openssl/pem.h>
-#include <openssl/rsa.h>
+#include <openssl/sha.h>
+#include <openssl/evp.h>
+#include <openssl/decoder.h>
 
 #include "common.h"
 #include "taskScheduler.h"
@@ -197,35 +198,33 @@ DWORD copyAndPrepFile(const wstring& src, const wstring& dest) {
 	return 0;
 }
 
-DWORD verifyRSASignature(unsigned char *originalMessage, std::streamsize om_length,
-	unsigned char *signature, unsigned siglen)
+DWORD verifyRSASignature(unsigned char* originalMessage, std::streamsize om_length,
+	unsigned char* signature, unsigned siglen)
 {
-	int result;
-	BIO *bio;
-	RSA *rsa_pubkey;
+	BIO* bio = BIO_new(BIO_s_mem());
+	EVP_PKEY* pkey = NULL;
+	OSSL_DECODER_CTX* key_ctx = OSSL_DECODER_CTX_new_for_pkey(&pkey, "PEM", NULL, "RSA", OSSL_KEYMGMT_SELECT_PUBLIC_KEY, NULL, NULL);
+	EVP_MD_CTX* sign_ctx = EVP_MD_CTX_create();
+	int result = 0;
 
-	bio = BIO_new(BIO_s_mem());
+	if (bio == NULL || key_ctx == NULL) goto cleanup;
+
 	int rc = BIO_puts(bio, PUBKEY);
-	if (rc < 0) return 1;
-	rsa_pubkey = PEM_read_bio_RSA_PUBKEY(bio, NULL, NULL, NULL);
-	if (!rsa_pubkey) return 1;
+	if (rc < 0) goto cleanup;
 
-	SHA512_CTX sha_ctx = { 0 };
-	unsigned char digest[SHA512_DIGEST_LENGTH];
+	rc = OSSL_DECODER_from_bio(key_ctx, bio);
+	if (rc != 1 || pkey == NULL) goto cleanup;
 
-	rc = SHA512_Init(&sha_ctx);
-	if (1 != rc) return 1;
+	rc = EVP_DigestVerifyInit(sign_ctx, NULL, EVP_sha512(), NULL, pkey);
+	if (rc != 1) goto cleanup;
 
-	rc = SHA512_Update(&sha_ctx, originalMessage, om_length);
-	if (1 != rc) return 1;
+	result = EVP_DigestVerify(sign_ctx, signature, siglen, originalMessage, om_length);
 
-	rc = SHA512_Final(digest, &sha_ctx);
-	if (1 != rc) return 1;
-
-	result = RSA_verify(NID_sha512, digest, SHA512_DIGEST_LENGTH,
-		signature, siglen, rsa_pubkey);
-
-	RSA_free(rsa_pubkey);
+cleanup:
+	if (bio != NULL) BIO_free(bio);
+	if (pkey != NULL) EVP_PKEY_free(pkey);
+	if (key_ctx != NULL) OSSL_DECODER_CTX_free(key_ctx);
+	if (sign_ctx != NULL) EVP_MD_CTX_free(sign_ctx);
 
 	return (result == 1) ? 0 : E_SIG_FAIL;
 }
