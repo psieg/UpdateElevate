@@ -314,7 +314,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 					return rc;
 				}
 
-				for (const WCHAR* fileName : {L"UpdateElevate.exe", L"libssl-1_1-x64.dll", L"libcrypto-1_1-x64.dll" , L"vcruntime140.dll", L"msvcp140.dll" }) {
+				for (const WCHAR* fileName : {L"UpdateElevate.exe"}) {
 					rc = copyAndPrepFile(executableDir + fileName, hostDir + L"\\" + fileName);
 					if (rc) {
 						logError(L"Run host failure");
