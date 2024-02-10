@@ -1,0 +1,31 @@
+name: CI
+on: 
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '43 16 * * FRI'
+jobs:
+  build-win:
+    name: Windows Build
+    runs-on: windows-2019
+    steps:
+      - uses: actions/checkout@v4
+      - run: choco install --no-progress openssl
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Build
+        shell: cmd
+        run: MSBuild.exe UpdateElevate.sln /p:Configuration=Release
+      - name: Check Package
+        shell: bash
+        run: |
+          set -xe
+          PKG_PATH=x64/Release/UpdateElevate.exe
+          PKG_NAME=$(basename "$PKG_PATH")
+          echo "PKG_PATH=$PKG_PATH" >> $GITHUB_ENV
+          echo "PKG_NAME=$PKG_NAME" >> $GITHUB_ENV
+      - name: Upload Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG_NAME }}
+          path: ${{ env.PKG_PATH }}
