@@ -1,3 +1,3 @@
 #define NAME L"Prismatik"
 #define EXT L".exe"
-#define ARGS L" /VERYSILENT"
+#define ARGS L" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART"
