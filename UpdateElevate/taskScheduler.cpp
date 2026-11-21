@@ -1,58 +1,67 @@
 #include "taskScheduler.h"
 #include "common.h"
 
-/********************************************************************
-This sample schedules a task to start on a weekly basis.
-********************************************************************/
 #include <Sddl.h>
-
 #include <ctime>
-#include <iostream>
 #include <stdio.h>
 #include <comdef.h>
-#include <wincred.h>
-//  Include the task header file.
 #include <taskschd.h>
+
 #pragma comment(lib, "taskschd.lib")
 #pragma comment(lib, "comsupp.lib")
-#pragma comment(lib, "credui.lib")
 
 using namespace std;
 
-DWORD schedule(bool install, bool elevate, BSTR name, BSTR condition, BSTR arg);
+static std::wstring escapeCommandLineArg(const std::wstring& arg) {
+	std::wstring out = L"\"";
+	size_t backslashes = 0;
+	for (wchar_t ch : arg) {
+		if (ch == L'\\') {
+			++backslashes;
+		} else if (ch == L'"') {
+			out.append(backslashes * 2 + 1, L'\\');
+			out.push_back(L'"');
+			backslashes = 0;
+		} else {
+			out.append(backslashes, L'\\');
+			backslashes = 0;
+			out.push_back(ch);
+		}
+	}
+	out.append(backslashes * 2, L'\\');
+	out.push_back(L'"');
+	return out;
+}
+
+static DWORD scheduleInternal(bool install, bool elevate, BSTR name, BSTR condition, BSTR args);
 
 DWORD schedule(bool install) {
+	_bstr_t query(L"<QueryList><Query Id=\"0\" Path=\"Application\"><Select Path=\"Application\">*[System[Provider[@Name='" FULLID L"'] and EventID=" EVT_ID_REQUEST_S L"]]</Select></Query></QueryList>");
+	_bstr_t args(L"trigger \"$(pkgPath)\"");
+	_bstr_t taskName(FULLID);
 
-	BSTR query = L"<QueryList><Query Id=\"0\" Path=\"Application\"><Select Path=\"Application\">*[System[Provider[@Name='" FULLID L"'] and EventID=" EVT_ID_REQUEST_S L"]]</Select></Query></QueryList>";
-
-	WCHAR args[] = L"trigger $(pkgPath)";
-
-	return schedule(install, true, FULLID, query, args);
+	return scheduleInternal(install, true, taskName, query, args);
 }
 
-DWORD schedule_cb(bool install, const wstring& callback) {
+DWORD schedule_cb(bool install, const wstring& callbackExe) {
+	_bstr_t query(L"<QueryList><Query Id=\"0\" Path=\"Application\"><Select Path=\"Application\">*[System[Provider[@Name='" FULLID L"'] and EventID=" EVT_ID_COMPLETED_S L"]]</Select></Query></QueryList>");
+	wstring args = L"completed";
+	if (!callbackExe.empty()) {
+		args.append(L" ");
+		args.append(escapeCommandLineArg(callbackExe));
+	}
+	_bstr_t bargs(args.c_str());
+	_bstr_t taskName(FULLIDCB);
 
-	BSTR query = L"<QueryList><Query Id=\"0\" Path=\"Application\"><Select Path=\"Application\">*[System[Provider[@Name='" FULLID L"'] and EventID=" EVT_ID_COMPLETED_S L"]]</Select></Query></QueryList>";
-
-	wstring args = L"completed ";
-	args.append(callback);
-	_bstr_t bargs = args.c_str();
-
-	return schedule(install, false, FULLIDCB, query, bargs);
+	return scheduleInternal(install, false, taskName, query, bargs);
 }
 
-DWORD schedule(bool install, bool elevate, BSTR name, BSTR condition, BSTR args)
+static DWORD scheduleInternal(bool install, bool elevate, BSTR name, BSTR condition, BSTR args)
 {
-	//  ------------------------------------------------------
-	//  Initialize COM.
 	HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
 	if (FAILED(hr))
-	{
-		printf("\nCoInitializeEx failed: %x", hr);
 		return 1;
-	}
 
-	//  Set general COM security levels.
 	hr = CoInitializeSecurity(
 		NULL,
 		-1,
@@ -64,19 +73,12 @@ DWORD schedule(bool install, bool elevate, BSTR name, BSTR condition, BSTR args)
 		0,
 		NULL);
 
-	if (FAILED(hr))
+	if (FAILED(hr) && hr != RPC_E_TOO_LATE)
 	{
-		printf("\nCoInitializeSecurity failed: %x", hr);
 		CoUninitialize();
 		return 1;
 	}
 
-	//  ------------------------------------------------------
-	//  Create a name for the task.
-
-
-	//  ------------------------------------------------------
-	//  Create an instance of the Task Service. 
 	ITaskService *pService = NULL;
 	hr = CoCreateInstance(CLSID_TaskScheduler,
 		NULL,
@@ -85,82 +87,62 @@ DWORD schedule(bool install, bool elevate, BSTR name, BSTR condition, BSTR args)
 		(void**)&pService);
 	if (FAILED(hr))
 	{
-		printf("Failed to create an instance of ITaskService: %x", hr);
 		CoUninitialize();
 		return 1;
 	}
 
-	//  Connect to the task service.
 	hr = pService->Connect(_variant_t(), _variant_t(),
 		_variant_t(), _variant_t());
 	if (FAILED(hr))
 	{
-		printf("ITaskService::Connect failed: %x", hr);
 		pService->Release();
 		CoUninitialize();
 		return 1;
 	}
 
-	//  ------------------------------------------------------
-	//  Get the pointer to the root task folder.  
-	//  This folder will hold the new task that is registered.
 	ITaskFolder *pRootFolder = NULL;
 	hr = pService->GetFolder(_bstr_t(L"\\"), &pRootFolder);
 	if (FAILED(hr))
 	{
-		printf("Cannot get Root Folder pointer: %x", hr);
 		pService->Release();
 		CoUninitialize();
 		return 1;
 	}
 
-	//  If the same task exists, remove it.
 	pRootFolder->DeleteTask(name, 0);
 
 	if (install) {
-
-		//  Create the task builder object to create the task.
 		ITaskDefinition *pTask = NULL;
 		hr = pService->NewTask(0, &pTask);
-
-		pService->Release();  // COM clean up.  Pointer is no longer used.
+		pService->Release();
+		pService = NULL;
 		if (FAILED(hr))
 		{
-			printf("Failed to create a task definition: %x", hr);
 			pRootFolder->Release();
 			CoUninitialize();
 			return 1;
 		}
 
-		//  ------------------------------------------------------
-		//  Get the registration info for setting the identification.
 		IRegistrationInfo *pRegInfo = NULL;
 		hr = pTask->get_RegistrationInfo(&pRegInfo);
 		if (FAILED(hr))
 		{
-			printf("\nCannot get identification pointer: %x", hr);
 			pRootFolder->Release();
 			pTask->Release();
 			CoUninitialize();
 			return 1;
 		}
 
-		hr = pRegInfo->put_Author( NAME L" (Automatic Updater)");
-		pRegInfo->Release();  // COM clean up.  Pointer is no longer used.
+		hr = pRegInfo->put_Author(_bstr_t(NAME L" (Automatic Updater)"));
+		pRegInfo->Release();
 		if (FAILED(hr))
 		{
-			printf("\nCannot put identification info: %x", hr);
 			pRootFolder->Release();
 			pTask->Release();
 			CoUninitialize();
 			return 1;
 		}
 
-
-		//  ------------------------------------------------------
-		//  Set other settings for the task
-
-		//  Create the settings for the task
 		ITaskSettings *pSettings = NULL;
 		hr = pTask->get_Settings(&pSettings);
 		if (FAILED(hr))
@@ -171,16 +153,12 @@ DWORD schedule(bool install, bool elevate, BSTR name, BSTR condition, BSTR args)
 			return 1;
 		}
 
-		//  Set setting values for the task. 
 		pSettings->put_DisallowStartIfOnBatteries(VARIANT_FALSE);
 		pSettings->put_StopIfGoingOnBatteries(VARIANT_FALSE);
 		pSettings->Release();
 
-		//  ------------------------------------------------------
-		//  Set the task to run elevated
 		if (elevate) {
-
-			IPrincipal *pPrincipal;
+			IPrincipal *pPrincipal = NULL;
 			hr = pTask->get_Principal(&pPrincipal);
 			if (FAILED(hr))
 			{
@@ -191,15 +169,13 @@ DWORD schedule(bool install, bool elevate, BSTR name, BSTR condition, BSTR args)
 			}
 
 			pPrincipal->put_RunLevel(TASK_RUNLEVEL_HIGHEST);
+			pPrincipal->Release();
 		}
 
-		//  ------------------------------------------------------
-		//  Get the trigger collection to insert the weekly trigger.
 		ITriggerCollection *pTriggerCollection = NULL;
 		hr = pTask->get_Triggers(&pTriggerCollection);
 		if (FAILED(hr))
 		{
-			printf("\nCannot get trigger collection: %x", hr);
 			pRootFolder->Release();
 			pTask->Release();
 			CoUninitialize();
@@ -211,7 +187,6 @@ DWORD schedule(bool install, bool elevate, BSTR name, BSTR condition, BSTR args)
 		pTriggerCollection->Release();
 		if (FAILED(hr))
 		{
-			printf("\nCannot create the trigger: %x", hr);
 			pRootFolder->Release();
 			pTask->Release();
 			CoUninitialize();
@@ -219,8 +194,7 @@ DWORD schedule(bool install, bool elevate, BSTR name, BSTR condition, BSTR args)
 		}
 
 		IEventTrigger *pEventTrigger = NULL;
-		hr = pTrigger->QueryInterface(
-			IID_IEventTrigger, (void**)&pEventTrigger);
+		hr = pTrigger->QueryInterface(IID_IEventTrigger, (void**)&pEventTrigger);
 		pTrigger->Release();
 		if (FAILED(hr))
 		{
@@ -246,7 +220,7 @@ DWORD schedule(bool install, bool elevate, BSTR name, BSTR condition, BSTR args)
 			now += 60 * 10;
 			char buf[sizeof "2011-10-08T07:07:09Z"];
 			tm expiry;
-			DWORD rc = gmtime_s(&expiry, &now);
+			gmtime_s(&expiry, &now);
 			strftime(buf, sizeof buf, "%Y-%m-%dT%H:%M:%SZ", &expiry);
 
 			hr = pEventTrigger->put_EndBoundary(_bstr_t(buf));
@@ -272,7 +246,7 @@ DWORD schedule(bool install, bool elevate, BSTR name, BSTR condition, BSTR args)
 		}
 
 		ITaskNamedValuePair *pPair = NULL;
-		pCollection->Create(L"pkgPath", L"Event/EventData/Data", &pPair);
+		hr = pCollection->Create(_bstr_t(L"pkgPath"), _bstr_t(L"Event/EventData/Data"), &pPair);
 		if (FAILED(hr))
 		{
 			pCollection->Release();
@@ -287,11 +261,7 @@ DWORD schedule(bool install, bool elevate, BSTR name, BSTR condition, BSTR args)
 		pCollection->Release();
 		pEventTrigger->Release();
 
-		//  ------------------------------------------------------
-		//  Add an Action to the task. This task will execute notepad.exe.     
 		IActionCollection *pActionCollection = NULL;
-
-		//  Get the task action collection pointer.
 		hr = pTask->get_Actions(&pActionCollection);
 		if (FAILED(hr))
 		{
@@ -301,7 +271,6 @@ DWORD schedule(bool install, bool elevate, BSTR name, BSTR condition, BSTR args)
 			return 1;
 		}
 
-		//  Create the action, specifying that it is an executable action.
 		IAction *pAction = NULL;
 		hr = pActionCollection->Create(TASK_ACTION_EXEC, &pAction);
 		pActionCollection->Release();
@@ -314,9 +283,7 @@ DWORD schedule(bool install, bool elevate, BSTR name, BSTR condition, BSTR args)
 		}
 
 		IExecAction *pExecAction = NULL;
-		//  QI for the executable task pointer.
-		hr = pAction->QueryInterface(
-			IID_IExecAction, (void**)&pExecAction);
+		hr = pAction->QueryInterface(IID_IExecAction, (void**)&pExecAction);
 		pAction->Release();
 		if (FAILED(hr))
 		{
@@ -326,20 +293,29 @@ DWORD schedule(bool install, bool elevate, BSTR name, BSTR condition, BSTR args)
 			return 1;
 		}
 
-		//  Set the path of the executable to self.
 		HMODULE hModule = GetModuleHandleW(NULL);
 		WCHAR executablePath[MAX_PATH];
-		GetModuleFileName(hModule, executablePath, MAX_PATH);
-		hr = pExecAction->put_Path(executablePath);
-		if (FAILED(hr))
+		DWORD pathLen = GetModuleFileNameW(hModule, executablePath, MAX_PATH);
+		if (pathLen == 0 || pathLen >= MAX_PATH)
 		{
+			pExecAction->Release();
 			pRootFolder->Release();
 			pTask->Release();
 			CoUninitialize();
 			return 1;
 		}
 
-		//  Set the args.
+		wstring quotedExe = escapeCommandLineArg(executablePath);
+		hr = pExecAction->put_Path(_bstr_t(quotedExe.c_str()));
+		if (FAILED(hr))
+		{
+			pExecAction->Release();
+			pRootFolder->Release();
+			pTask->Release();
+			CoUninitialize();
+			return 1;
+		}
+
 		hr = pExecAction->put_Arguments(args);
 		pExecAction->Release();
 		if (FAILED(hr))
@@ -350,21 +326,16 @@ DWORD schedule(bool install, bool elevate, BSTR name, BSTR condition, BSTR args)
 			return 1;
 		}
 
-
-		//  ------------------------------------------------------
-		//  Save the task in the root folder.
 		VARIANT varnull;
+		VariantInit(&varnull);
 		varnull.vt = VT_NULL;
-
-		BSTR xml;
-		pTask->get_XmlText(&xml);
 
 		IRegisteredTask *pRegisteredTask = NULL;
 		hr = pRootFolder->RegisterTaskDefinition(
 			name,
 			pTask,
 			TASK_CREATE_OR_UPDATE,
-			elevate ? _variant_t(_bstr_t(L"S-1-5-18")) : varnull, // SYSTEM account
+			elevate ? _variant_t(_bstr_t(L"S-1-5-18")) : varnull,
 			varnull,
 			TASK_LOGON_INTERACTIVE_TOKEN,
 			_variant_t(L""),
@@ -379,11 +350,11 @@ DWORD schedule(bool install, bool elevate, BSTR name, BSTR condition, BSTR args)
 
 		pTask->Release();
 		pRegisteredTask->Release();
+	} else {
+		pService->Release();
 	}
 
-	//  Clean up
 	pRootFolder->Release();
 	CoUninitialize();
 	return 0;
 }
-

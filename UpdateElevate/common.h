@@ -1,11 +1,10 @@
-
+#pragma once
 
 #include "command.h"
 #if !defined(NAME) || !defined(EXT) || !defined(ARGS)
 #error "Must define NAME, EXT and ARGS before building. Overwrite command.h"
 #endif
 
-#define HOSTPATH L"C:\\Windows\\Temp\\"
 #define FULLID L"PsiegUpdateElevate_" NAME
 #define FULLIDCB L"PsiegUpdateElevate_" NAME L"_Completion"
 

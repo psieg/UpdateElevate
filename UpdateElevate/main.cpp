@@ -1,496 +1,926 @@
-
 #define _CRT_SECURE_NO_WARNINGS
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 
 #include <Windows.h>
+#include <shellapi.h>
 #include <AclAPI.h>
+#include <Sddl.h>
+#include <ShlObj.h>
+#include <wincrypt.h>
+#include <bcrypt.h>
 
 #include <string>
-#include <iostream>
-#include <fstream>
 #include <vector>
-using namespace std;
-
-#include <openssl/sha.h>
-#include <openssl/evp.h>
-#include <openssl/decoder.h>
 
 #include "common.h"
 #include "taskScheduler.h"
+
+#pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
 
 #define E_ARGS 1000
 #define E_FILES_MISSING 1001
 #define E_SIG_FAIL 1002
 #define E_PRIVILEGE 1003
+#define E_REPARSE_OR_PATH 1004
+#define E_STAGE_FAIL 1005
 
-#define PUBKEY "-----BEGIN PUBLIC KEY-----\n\
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvOzz+Ih6jYbyEsjkF28s\n\
-Four2hRPEjJCVXfHf2+sbFONqnPpM18Ri0+4zOidaZf/l790AJOh5YJZfVhPHTQa\n\
-GTUWagPQ9RrXDDymFprQFpBXJSJvnFjOWGazB2x+dA+RrGiKymujrE5RIScHDeUC\n\
-GJ60dGzGzAulWoFlbzkNMlO4HuyXJB8hgsFNNI1a9Bezv5ApfG+xtLvWznmiAvW5\n\
-y7gwrFL3sko5bRhjGrzfKI/WT9XTzbwwIt8Wg2oOzg2PfBoXrMTRtrXuHkh9AyVH\n\
-/Mi+3pBeT8TaaRsPD6s/qX/lphmaGNfuyKCENDcZKCUmGcFXSxFxPpBXcrSqn5hm\n\
-LwIDAQAB\n\
------END PUBLIC KEY-----"
+static constexpr LONGLONG kMaxPackageBytes = 512LL * 1024 * 1024; // 512 MiB cap
+static constexpr LONGLONG kMinSigBytes = 64;
+static constexpr LONGLONG kMaxSigBytes = 1024; // 2048-bit RSA sig is 256 bytes
 
-BOOL logError(LPCWSTR msg) {
+static const char kPubKeyPem[] =
+"-----BEGIN PUBLIC KEY-----\n"
+"MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvOzz+Ih6jYbyEsjkF28s\n"
+"Four2hRPEjJCVXfHf2+sbFONqnPpM18Ri0+4zOidaZf/l790AJOh5YJZfVhPHTQa\n"
+"GTUWagPQ9RrXDDymFprQFpBXJSJvnFjOWGazB2x+dA+RrGiKymujrE5RIScHDeUC\n"
+"GJ60dGzGzAulWoFlbzkNMlO4HuyXJB8hgsFNNI1a9Bezv5ApfG+xtLvWznmiAvW5\n"
+"y7gwrFL3sko5bRhjGrzfKI/WT9XTzbwwIt8Wg2oOzg2PfBoXrMTRtrXuHkh9AyVH\n"
+"/Mi+3pBeT8TaaRsPD6s/qX/lphmaGNfuyKCENDcZKCUmGcFXSxFxPpBXcrSqn5hm\n"
+"LwIDAQAB\n"
+"-----END PUBLIC KEY-----";
+
+static BOOL logError(LPCWSTR msg) {
 	HANDLE hEventSrc = RegisterEventSourceW(NULL, FULLID);
-	BOOL rc = ReportEvent(hEventSrc, EVENTLOG_ERROR_TYPE & 0xFFFF, 0, EVT_ID_LOG, NULL, 1, 0, &msg, NULL);
+	if (!hEventSrc) return TRUE;
+	BOOL rc = ReportEventW(hEventSrc, EVENTLOG_ERROR_TYPE & 0xFFFF, 0, EVT_ID_LOG, NULL, 1, 0, &msg, NULL);
 	DeregisterEventSource(hEventSrc);
 	return !rc;
 }
 
-BOOL logMessage(LPCWSTR msg) {
+static BOOL logMessage(LPCWSTR msg) {
 	HANDLE hEventSrc = RegisterEventSourceW(NULL, FULLID);
-	BOOL rc = ReportEvent(hEventSrc, EVENTLOG_INFORMATION_TYPE & 0xFFFF, 0, EVT_ID_LOG, NULL, 1, 0, &msg, NULL);
+	if (!hEventSrc) return TRUE;
+	BOOL rc = ReportEventW(hEventSrc, EVENTLOG_INFORMATION_TYPE & 0xFFFF, 0, EVT_ID_LOG, NULL, 1, 0, &msg, NULL);
 	DeregisterEventSource(hEventSrc);
 	return !rc;
 }
 
-BOOL send_request(LPCWSTR filepath) {
+static BOOL send_request(LPCWSTR filepath) {
 	HANDLE hEventSrc = RegisterEventSourceW(NULL, FULLID);
-	BOOL rc = ReportEvent(hEventSrc, EVENTLOG_INFORMATION_TYPE & 0xFFFF, 0, EVT_ID_REQUEST, NULL, 1, 0, &filepath, NULL);
+	if (!hEventSrc) return TRUE;
+	BOOL rc = ReportEventW(hEventSrc, EVENTLOG_INFORMATION_TYPE & 0xFFFF, 0, EVT_ID_REQUEST, NULL, 1, 0, &filepath, NULL);
 	DeregisterEventSource(hEventSrc);
 	return !rc;
 }
 
-BOOL send_completed() {
+static BOOL send_completed() {
 	HANDLE hEventSrc = RegisterEventSourceW(NULL, FULLID);
-	BOOL rc = ReportEvent(hEventSrc, EVENTLOG_INFORMATION_TYPE & 0xFFFF, 0, EVT_ID_COMPLETED, NULL, 0, 0, NULL, NULL);
+	if (!hEventSrc) return TRUE;
+	BOOL rc = ReportEventW(hEventSrc, EVENTLOG_INFORMATION_TYPE & 0xFFFF, 0, EVT_ID_COMPLETED, NULL, 0, 0, NULL, NULL);
 	DeregisterEventSource(hEventSrc);
 	return !rc;
 }
 
-BOOL IsUserAdmin() {
-	// http://msdn.microsoft.com/en-us/library/windows/desktop/aa376389%28v=vs.85%29.aspx
-
-	BOOL b;
-	SID_IDENTIFIER_AUTHORITY NtAuthority = SECURITY_NT_AUTHORITY;
-	PSID AdministratorsGroup;
-	b = AllocateAndInitializeSid(
-		&NtAuthority,
+static BOOL IsUserAdmin() {
+	BOOL isAdmin = FALSE;
+	SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+	PSID administratorsGroup = NULL;
+	if (AllocateAndInitializeSid(
+		&ntAuthority,
 		2,
 		SECURITY_BUILTIN_DOMAIN_RID,
 		DOMAIN_ALIAS_RID_ADMINS,
 		0, 0, 0, 0, 0, 0,
-		&AdministratorsGroup);
-	if (b)
+		&administratorsGroup))
 	{
-		if (!CheckTokenMembership(NULL, AdministratorsGroup, &b))
-		{
-			b = FALSE;
-		}
-		FreeSid(AdministratorsGroup);
+		if (!CheckTokenMembership(NULL, administratorsGroup, &isAdmin))
+			isAdmin = FALSE;
+		FreeSid(administratorsGroup);
 	}
-
-	return(b);
+	return isAdmin;
 }
 
-bool FileExists(const TCHAR *fileName)
-{
-	DWORD fileAttr;
+static std::wstring quoteCommandLineArg(const std::wstring& arg) {
+	std::wstring out = L"\"";
+	size_t backslashes = 0;
+	for (wchar_t ch : arg) {
+		if (ch == L'\\') {
+			++backslashes;
+		} else if (ch == L'"') {
+			out.append(backslashes * 2 + 1, L'\\');
+			out.push_back(L'"');
+			backslashes = 0;
+		} else {
+			out.append(backslashes, L'\\');
+			backslashes = 0;
+			out.push_back(ch);
+		}
+	}
+	out.append(backslashes * 2, L'\\');
+	out.push_back(L'"');
+	return out;
+}
 
-	fileAttr = GetFileAttributes(fileName);
-	if (0xFFFFFFFF == fileAttr)
+static bool getCurrentExecutablePath(std::wstring& exePath, std::wstring& exeDir) {
+	std::vector<wchar_t> buf(MAX_PATH);
+	for (;;) {
+		DWORD len = GetModuleFileNameW(NULL, buf.data(), static_cast<DWORD>(buf.size()));
+		if (len == 0)
+			return false;
+		if (len < buf.size() - 1) {
+			exePath.assign(buf.data(), len);
+			size_t slash = exePath.find_last_of(L"\\/");
+			if (slash == std::wstring::npos)
+				return false;
+			exeDir = exePath.substr(0, slash + 1);
+			return true;
+		}
+		if (buf.size() >= 32768)
+			return false;
+		buf.resize(buf.size() * 2);
+	}
+}
+
+static std::wstring getStagingHostDir() {
+	PWSTR pszProgramData = NULL;
+	std::wstring base = L"C:\\ProgramData";
+	if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramData, KF_FLAG_DEFAULT, NULL, &pszProgramData)) && pszProgramData) {
+		base = pszProgramData;
+		CoTaskMemFree(pszProgramData);
+	}
+	while (!base.empty() && (base.back() == L'\\' || base.back() == L'/'))
+		base.pop_back();
+	return base + L"\\" FULLID;
+}
+
+static bool normalizeDirectoryArg(const std::wstring& rawDir, std::wstring& normalizedDir) {
+	if (rawDir.empty())
 		return false;
+
+	for (wchar_t ch : rawDir) {
+		if (ch < 0x20 || ch == L'"' || ch == L'<' || ch == L'>' || ch == L'|' || ch == L'?' || ch == L'*')
+			return false;
+	}
+
+	DWORD needed = GetFullPathNameW(rawDir.c_str(), 0, NULL, NULL);
+	if (needed == 0 || needed > 32768)
+		return false;
+
+	std::vector<wchar_t> fullBuf(needed + 1, L'\0');
+	DWORD written = GetFullPathNameW(rawDir.c_str(), needed + 1, fullBuf.data(), NULL);
+	if (written == 0 || written >= needed + 1)
+		return false;
+
+	normalizedDir.assign(fullBuf.data(), written);
+	while (normalizedDir.size() > 3 && (normalizedDir.back() == L'\\' || normalizedDir.back() == L'/'))
+		normalizedDir.pop_back();
+
+	// Reject UNC / device namespace paths (require standard local drive root e.g. C:\...)
+	if (normalizedDir.size() < 3 || normalizedDir[1] != L':' || normalizedDir[2] != L'\\')
+		return false;
+
 	return true;
 }
 
-DWORD prepFile(const wstring& filename) {
-	EXPLICIT_ACCESS eas[2];
-	PACL pACL = 0;
-	DWORD rc;
-	SID_IDENTIFIER_AUTHORITY SIDAuthWorld = SECURITY_WORLD_SID_AUTHORITY;
-	PSID pEveryoneSID = NULL;
-	memset(eas, 0, sizeof(eas));
-	if (!AllocateAndInitializeSid(&SIDAuthWorld, 1,
-		SECURITY_WORLD_RID, 0, 0, 0, 0, 0, 0, 0, &pEveryoneSID)) {
-		return GetLastError();
-	}
-
-	eas[0].grfAccessPermissions = GENERIC_READ | GENERIC_EXECUTE;
-	eas[0].grfAccessMode = GRANT_ACCESS;
-	eas[0].grfInheritance = NO_INHERITANCE;
-	eas[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
-	eas[0].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
-	eas[0].Trustee.ptstrName = (LPTSTR)pEveryoneSID;
-
-	eas[1].grfAccessPermissions = GENERIC_ALL;
-	eas[1].grfAccessMode = GRANT_ACCESS;
-	eas[1].grfInheritance = NO_INHERITANCE;
-	eas[1].Trustee.TrusteeForm = TRUSTEE_IS_NAME;
-	eas[1].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
-	eas[1].Trustee.ptstrName = L"CURRENT_USER";
-
-	rc = SetEntriesInAcl(2, &eas[0], NULL, &pACL);
-	if (rc != ERROR_SUCCESS)
+// Ensures `dirPath` is a real directory (not a symlink/junction/mount point) owned by Administrators
+// with a Protected DACL granting access exclusively to SYSTEM (SY) and Administrators (BA).
+static DWORD ensureLockedSystemDirectory(const std::wstring& dirPath) {
+	PSECURITY_DESCRIPTOR pSD = NULL;
+	// Protected DACL: SYSTEM Full Control + Builtin Administrators Full Control (inheritable)
+	if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+		L"D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+		SDDL_REVISION_1,
+		&pSD,
+		NULL))
 	{
-		//wstring msg = L"entries" + std::to_wstring(rc);
-		//logError(msg.c_str());
-		//printf("SetEntriesInAcl: %u\n", rc);
-		return rc;
-	}
-
-	TCHAR namebuf[40];
-	DWORD bufs = 40;
-	rc = GetUserName(namebuf, &bufs);
-	if (!rc) {
-		//wstring msg = L"name" + std::to_wstring(rc);
-		//logError(msg.c_str());
 		return GetLastError();
 	}
 
-	BYTE sidbuf[1024];
-	bufs = 1024;
-	TCHAR sidbuf2[1024];
-	DWORD bufs2 = 1024;
-	SID_NAME_USE snu;
-	rc = LookupAccountName(NULL, namebuf, sidbuf, &bufs, sidbuf2, &bufs2, &snu);
-	if (!rc){
-		//wstring msg = L"lookup" + std::to_wstring(rc);
-		//logError(msg.c_str());
-		return GetLastError();
+	SECURITY_ATTRIBUTES sa = {};
+	sa.nLength = sizeof(sa);
+	sa.lpSecurityDescriptor = pSD;
+	sa.bInheritHandle = FALSE;
+
+	if (!CreateDirectoryW(dirPath.c_str(), &sa)) {
+		DWORD err = GetLastError();
+		if (err != ERROR_ALREADY_EXISTS) {
+			LocalFree(pSD);
+			return err;
+		}
 	}
 
-	rc = SetNamedSecurityInfo((LPTSTR)filename.c_str(), SE_FILE_OBJECT,
+	// Open the directory WITHOUT following reparse points so junctions/mount-points cannot redirect us.
+	HANDLE hDir = CreateFileW(
+		dirPath.c_str(),
+		READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+		FILE_SHARE_READ | FILE_SHARE_WRITE,
+		NULL,
+		OPEN_EXISTING,
+		FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+		NULL);
+	if (hDir == INVALID_HANDLE_VALUE) {
+		DWORD err = GetLastError();
+		LocalFree(pSD);
+		return err;
+	}
+
+	BY_HANDLE_FILE_INFORMATION info = {};
+	if (!GetFileInformationByHandle(hDir, &info)) {
+		DWORD err = GetLastError();
+		CloseHandle(hDir);
+		LocalFree(pSD);
+		return err;
+	}
+
+	if ((info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+		(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+	{
+		CloseHandle(hDir);
+		LocalFree(pSD);
+		return E_REPARSE_OR_PATH;
+	}
+
+	BOOL daclPresent = FALSE;
+	BOOL daclDefaulted = FALSE;
+	PACL pDacl = NULL;
+	if (!GetSecurityDescriptorDacl(pSD, &daclPresent, &pDacl, &daclDefaulted) || !daclPresent || !pDacl) {
+		CloseHandle(hDir);
+		LocalFree(pSD);
+		return E_STAGE_FAIL;
+	}
+
+	SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+	PSID pAdminsSid = NULL;
+	if (!AllocateAndInitializeSid(
+		&ntAuthority,
+		2,
+		SECURITY_BUILTIN_DOMAIN_RID,
+		DOMAIN_ALIAS_RID_ADMINS,
+		0, 0, 0, 0, 0, 0,
+		&pAdminsSid))
+	{
+		DWORD err = GetLastError();
+		CloseHandle(hDir);
+		LocalFree(pSD);
+		return err;
+	}
+
+	// Apply owner + protected DACL directly on the verified directory handle (race-free).
+	DWORD rc = SetSecurityInfo(
+		hDir,
+		SE_FILE_OBJECT,
 		OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-		sidbuf, NULL, pACL, NULL);
-	if (rc) return rc;
+		pAdminsSid,
+		NULL,
+		pDacl,
+		NULL);
 
-	// because these files are now hard to remove, schedule them for deletion upon reboot (we might fail to delete it in case of errors)
-#ifdef _DEBUG
-	if (IsUserAdmin()) {
-#endif
-		rc = MoveFileEx(filename.c_str(), NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
-		if (!rc) return GetLastError();
-#ifdef _DEBUG
-	}
-#endif
-
-	LocalFree(pACL);
-
-	return 0;
+	FreeSid(pAdminsSid);
+	CloseHandle(hDir);
+	LocalFree(pSD);
+	return rc;
 }
 
-DWORD copyAndPrepFile(const wstring& src, const wstring& dest) {
-	SECURITY_ATTRIBUTES attrs;
-	attrs.bInheritHandle = FALSE;
-	attrs.lpSecurityDescriptor = NULL;
-	attrs.nLength = sizeof(SECURITY_ATTRIBUTES);
-	HANDLE hFile = CreateFile(dest.c_str(), GENERIC_WRITE, NULL, &attrs, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
-	if (hFile == INVALID_HANDLE_VALUE) {
-		logError(L"Create host copy failed");
-		return GetLastError();
+static DWORD purgeStagingDirectory(const std::wstring& dirPath) {
+	std::wstring pattern = dirPath + L"\\*";
+	WIN32_FIND_DATAW fd = {};
+	HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+	if (hFind == INVALID_HANDLE_VALUE) {
+		DWORD err = GetLastError();
+		return (err == ERROR_FILE_NOT_FOUND) ? 0 : err;
+	}
+
+	DWORD result = 0;
+	do {
+		if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
+			continue;
+
+		std::wstring itemPath = dirPath + L"\\" + fd.cFileName;
+		if ((fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+			if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+				RemoveDirectoryW(itemPath.c_str());
+			else
+				DeleteFileW(itemPath.c_str());
+			continue;
+		}
+
+		if ((fd.dwFileAttributes & FILE_ATTRIBUTE_READONLY) != 0)
+			SetFileAttributesW(itemPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+
+		if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+			DWORD subRc = purgeStagingDirectory(itemPath);
+			if (subRc != 0 && result == 0)
+				result = subRc;
+			if (!RemoveDirectoryW(itemPath.c_str()) && result == 0)
+				result = GetLastError();
+		} else {
+			if (!DeleteFileW(itemPath.c_str()) && result == 0)
+				result = GetLastError();
+		}
+	} while (FindNextFileW(hFind, &fd));
+
+	FindClose(hFind);
+	return result;
+}
+
+static bool safeDeleteRegularFile(const std::wstring& path) {
+	HANDLE hFile = CreateFileW(
+		path.c_str(),
+		DELETE | FILE_READ_ATTRIBUTES,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		NULL,
+		OPEN_EXISTING,
+		FILE_FLAG_OPEN_REPARSE_POINT,
+		NULL);
+	if (hFile == INVALID_HANDLE_VALUE)
+		return false;
+
+	BY_HANDLE_FILE_INFORMATION info = {};
+	bool ok = false;
+	if (GetFileInformationByHandle(hFile, &info) &&
+		(info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0)
+	{
+		FILE_DISPOSITION_INFO disp = {};
+		disp.DeleteFile = TRUE;
+		ok = SetFileInformationByHandle(hFile, FileDispositionInfo, &disp, sizeof(disp)) != FALSE;
 	}
 	CloseHandle(hFile);
+	return ok;
+}
 
-	DWORD rc = prepFile(dest);
-	if (rc) {
-		logError(L"prep host copy failed");
-		return GetLastError();
-	}
-
-	rc = CopyFile(src.c_str(), dest.c_str(), FALSE);
-	if (!rc) {
-		logError(L"copy host copy failed");
+static DWORD readSignatureFile(const std::wstring& sigPath, std::vector<BYTE>& outSig) {
+	HANDLE hSig = CreateFileW(
+		sigPath.c_str(),
+		GENERIC_READ,
+		FILE_SHARE_READ,
+		NULL,
+		OPEN_EXISTING,
+		FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN,
+		NULL);
+	if (hSig == INVALID_HANDLE_VALUE)
 		return E_FILES_MISSING;
+
+	BY_HANDLE_FILE_INFORMATION info = {};
+	LARGE_INTEGER fileSize = {};
+	if (!GetFileInformationByHandle(hSig, &info) ||
+		(info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
+		!GetFileSizeEx(hSig, &fileSize) ||
+		fileSize.QuadPart < kMinSigBytes ||
+		fileSize.QuadPart > kMaxSigBytes)
+	{
+		CloseHandle(hSig);
+		return E_SIG_FAIL;
 	}
+
+	outSig.resize(static_cast<size_t>(fileSize.QuadPart));
+	DWORD bytesRead = 0;
+	BOOL readOk = ReadFile(hSig, outSig.data(), static_cast<DWORD>(outSig.size()), &bytesRead, NULL);
+	CloseHandle(hSig);
+
+	if (!readOk || bytesRead != outSig.size())
+		return E_SIG_FAIL;
 
 	return 0;
 }
 
-DWORD verifyRSASignature(unsigned char* originalMessage, std::streamsize om_length,
-	unsigned char* signature, unsigned siglen)
-{
-	BIO* bio = BIO_new(BIO_s_mem());
-	EVP_PKEY* pkey = NULL;
-	OSSL_DECODER_CTX* key_ctx = OSSL_DECODER_CTX_new_for_pkey(&pkey, "PEM", NULL, "RSA", OSSL_KEYMGMT_SELECT_PUBLIC_KEY, NULL, NULL);
-	EVP_MD_CTX* sign_ctx = EVP_MD_CTX_create();
-	int result = 0;
+static DWORD stageCandidateFile(const std::wstring& srcPkgPath, const std::wstring& dstPkgPath) {
+	HANDLE hSrc = CreateFileW(
+		srcPkgPath.c_str(),
+		GENERIC_READ,
+		FILE_SHARE_READ,
+		NULL,
+		OPEN_EXISTING,
+		FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN,
+		NULL);
+	if (hSrc == INVALID_HANDLE_VALUE)
+		return E_FILES_MISSING;
 
-	if (bio == NULL || key_ctx == NULL) goto cleanup;
+	BY_HANDLE_FILE_INFORMATION srcInfo = {};
+	LARGE_INTEGER srcSize = {};
+	if (!GetFileInformationByHandle(hSrc, &srcInfo) ||
+		(srcInfo.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
+		!GetFileSizeEx(hSrc, &srcSize) ||
+		srcSize.QuadPart <= 0 ||
+		srcSize.QuadPart > kMaxPackageBytes)
+	{
+		CloseHandle(hSrc);
+		return E_REPARSE_OR_PATH;
+	}
 
-	int rc = BIO_puts(bio, PUBKEY);
-	if (rc < 0) goto cleanup;
+	HANDLE hDst = CreateFileW(
+		dstPkgPath.c_str(),
+		GENERIC_WRITE,
+		0, // Exclusive lock while staging
+		NULL,
+		CREATE_ALWAYS,
+		FILE_ATTRIBUTE_NORMAL,
+		NULL);
+	if (hDst == INVALID_HANDLE_VALUE) {
+		CloseHandle(hSrc);
+		return E_STAGE_FAIL;
+	}
 
-	rc = OSSL_DECODER_from_bio(key_ctx, bio);
-	if (rc != 1 || pkey == NULL) goto cleanup;
+	std::vector<BYTE> chunk(64 * 1024);
+	LONGLONG totalCopied = 0;
+	DWORD status = 0;
 
-	rc = EVP_DigestVerifyInit(sign_ctx, NULL, EVP_sha512(), NULL, pkey);
-	if (rc != 1) goto cleanup;
+	for (;;) {
+		DWORD bytesRead = 0;
+		if (!ReadFile(hSrc, chunk.data(), static_cast<DWORD>(chunk.size()), &bytesRead, NULL)) {
+			status = E_STAGE_FAIL;
+			break;
+		}
+		if (bytesRead == 0)
+			break;
 
-	result = EVP_DigestVerify(sign_ctx, signature, siglen, originalMessage, om_length);
+		totalCopied += bytesRead;
+		if (totalCopied > kMaxPackageBytes) {
+			status = E_REPARSE_OR_PATH;
+			break;
+		}
 
-cleanup:
-	if (bio != NULL) BIO_free(bio);
-	if (pkey != NULL) EVP_PKEY_free(pkey);
-	if (key_ctx != NULL) OSSL_DECODER_CTX_free(key_ctx);
-	if (sign_ctx != NULL) EVP_MD_CTX_free(sign_ctx);
+		DWORD bytesWritten = 0;
+		if (!WriteFile(hDst, chunk.data(), bytesRead, &bytesWritten, NULL) || bytesWritten != bytesRead) {
+			status = E_STAGE_FAIL;
+			break;
+		}
+	}
 
-	return (result == 1) ? 0 : E_SIG_FAIL;
+	if (status == 0 && totalCopied != srcSize.QuadPart)
+		status = E_STAGE_FAIL;
+
+	if (status == 0)
+		FlushFileBuffers(hDst);
+
+	CloseHandle(hDst);
+	CloseHandle(hSrc);
+
+	if (status != 0)
+		DeleteFileW(dstPkgPath.c_str());
+
+	return status;
 }
 
+// Verifies RSA-2048 PKCS#1 v1.5 SHA-512 signature over an open, write-locked file handle using Windows CNG.
+static DWORD verifyFileRSASignature(HANDLE hLockedFile, const std::vector<BYTE>& signature) {
+	if (hLockedFile == INVALID_HANDLE_VALUE || signature.empty())
+		return E_SIG_FAIL;
 
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, int iCmdShow){
+	LARGE_INTEGER zero = {};
+	if (!SetFilePointerEx(hLockedFile, zero, NULL, FILE_BEGIN))
+		return E_SIG_FAIL;
 
+	DWORD derLen = 0;
+	if (!CryptStringToBinaryA(kPubKeyPem, 0, CRYPT_STRING_BASE64HEADER, NULL, &derLen, NULL, NULL) || derLen == 0)
+		return E_SIG_FAIL;
 
-	struct Args
+	std::vector<BYTE> derKey(derLen);
+	if (!CryptStringToBinaryA(kPubKeyPem, 0, CRYPT_STRING_BASE64HEADER, derKey.data(), &derLen, NULL, NULL))
+		return E_SIG_FAIL;
+
+	CERT_PUBLIC_KEY_INFO* pPubKeyInfo = NULL;
+	DWORD pubKeyInfoLen = 0;
+	if (!CryptDecodeObjectEx(
+		X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+		X509_PUBLIC_KEY_INFO,
+		derKey.data(),
+		derLen,
+		CRYPT_DECODE_ALLOC_FLAG,
+		NULL,
+		&pPubKeyInfo,
+		&pubKeyInfoLen) || !pPubKeyInfo)
 	{
-		int n;
-		LPWSTR* p;
+		return E_SIG_FAIL;
+	}
 
-		~Args() { if (p != 0) { ::LocalFree(p); } }
-		Args() : p(::CommandLineToArgvW(::GetCommandLine(), &n)) {}
+	BCRYPT_KEY_HANDLE hKey = NULL;
+	BOOL imported = CryptImportPublicKeyInfoEx2(X509_ASN_ENCODING, pPubKeyInfo, 0, NULL, &hKey);
+	LocalFree(pPubKeyInfo);
+	if (!imported || !hKey)
+		return E_SIG_FAIL;
+
+	BCRYPT_ALG_HANDLE hHashAlg = NULL;
+	BCRYPT_HASH_HANDLE hHash = NULL;
+	DWORD rc = E_SIG_FAIL;
+	BYTE digest[64] = {};
+	std::vector<BYTE> hashObj;
+	DWORD hashObjLen = 0;
+	DWORD cbResult = 0;
+
+	if (BCryptOpenAlgorithmProvider(&hHashAlg, BCRYPT_SHA512_ALGORITHM, NULL, 0) != 0)
+		goto cleanup;
+
+	if (BCryptGetProperty(hHashAlg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&hashObjLen), sizeof(hashObjLen), &cbResult, 0) != 0 || hashObjLen == 0)
+		goto cleanup;
+
+	hashObj.resize(hashObjLen);
+	if (BCryptCreateHash(hHashAlg, &hHash, hashObj.data(), hashObjLen, NULL, 0, 0) != 0)
+		goto cleanup;
+
+	{
+		std::vector<BYTE> readBuf(64 * 1024);
+		LONGLONG hashedBytes = 0;
+		for (;;) {
+			DWORD bytesRead = 0;
+			if (!ReadFile(hLockedFile, readBuf.data(), static_cast<DWORD>(readBuf.size()), &bytesRead, NULL))
+				goto cleanup;
+			if (bytesRead == 0)
+				break;
+			hashedBytes += bytesRead;
+			if (hashedBytes > kMaxPackageBytes)
+				goto cleanup;
+			if (BCryptHashData(hHash, readBuf.data(), bytesRead, 0) != 0)
+				goto cleanup;
+		}
+		if (hashedBytes <= 0)
+			goto cleanup;
+	}
+
+	if (BCryptFinishHash(hHash, digest, sizeof(digest), 0) != 0)
+		goto cleanup;
+
+	{
+		BCRYPT_PKCS1_PADDING_INFO padInfo = {};
+		padInfo.pszAlgId = BCRYPT_SHA512_ALGORITHM;
+		NTSTATUS verifyStatus = BCryptVerifySignature(
+			hKey,
+			&padInfo,
+			digest,
+			sizeof(digest),
+			const_cast<PUCHAR>(signature.data()),
+			static_cast<ULONG>(signature.size()),
+			BCRYPT_PAD_PKCS1);
+		if (verifyStatus == 0)
+			rc = 0;
+	}
+
+cleanup:
+	if (hHash) BCryptDestroyHash(hHash);
+	if (hHashAlg) BCryptCloseAlgorithmProvider(hHashAlg, 0);
+	if (hKey) BCryptDestroyKey(hKey);
+	return rc;
+}
+
+// Validates that a requested post-update callback binary is `{exeDir}\{NAME}{EXT}` (Prismatik.exe alongside UpdateElevate.exe).
+static bool resolveAllowedCallbackExecutable(const std::wstring& requestedPath, std::wstring& allowedExeOut) {
+	std::wstring selfExe, selfDir;
+	if (!getCurrentExecutablePath(selfExe, selfDir))
+		return false;
+
+	std::wstring expectedExe = selfDir + NAME EXT;
+
+	DWORD needed = GetFullPathNameW(requestedPath.c_str(), 0, NULL, NULL);
+	if (needed == 0 || needed > 32768)
+		return false;
+	std::vector<wchar_t> fullBuf(needed + 1, L'\0');
+	DWORD written = GetFullPathNameW(requestedPath.c_str(), needed + 1, fullBuf.data(), NULL);
+	if (written == 0 || written >= needed + 1)
+		return false;
+
+	if (CompareStringOrdinal(fullBuf.data(), static_cast<int>(written), expectedExe.c_str(), static_cast<int>(expectedExe.size()), TRUE) == CSTR_EQUAL) {
+		allowedExeOut = expectedExe;
+		return true;
+	}
+
+	// Fallback for 8.3 short-path vs long-path equivalence: verify both paths resolve to the exact same regular file object.
+	HANDLE hReq = CreateFileW(fullBuf.data(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+	if (hReq == INVALID_HANDLE_VALUE)
+		return false;
+	HANDLE hExp = CreateFileW(expectedExe.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+	if (hExp == INVALID_HANDLE_VALUE) {
+		CloseHandle(hReq);
+		return false;
+	}
+
+	BY_HANDLE_FILE_INFORMATION reqInfo = {};
+	BY_HANDLE_FILE_INFORMATION expInfo = {};
+	bool sameFile = GetFileInformationByHandle(hReq, &reqInfo) &&
+		GetFileInformationByHandle(hExp, &expInfo) &&
+		(expInfo.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 &&
+		reqInfo.dwVolumeSerialNumber == expInfo.dwVolumeSerialNumber &&
+		reqInfo.nFileIndexHigh == expInfo.nFileIndexHigh &&
+		reqInfo.nFileIndexLow == expInfo.nFileIndexLow;
+
+	CloseHandle(hExp);
+	CloseHandle(hReq);
+
+	if (!sameFile)
+		return false;
+
+	allowedExeOut = expectedExe;
+	return true;
+}
+
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, int iCmdShow) {
+	UNREFERENCED_PARAMETER(hInstance);
+	UNREFERENCED_PARAMETER(hpInstance);
+	UNREFERENCED_PARAMETER(nCmdLine);
+	UNREFERENCED_PARAMETER(iCmdShow);
+
+	// Restrict all dynamic DLL loads to C:\Windows\System32 to prevent DLL sideloading.
+	SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+
+	struct Args {
+		int n = 0;
+		LPWSTR* p = nullptr;
+		~Args() { if (p) ::LocalFree(p); }
+		Args() : p(::CommandLineToArgvW(::GetCommandLineW(), &n)) {}
 	};
 
-	Args    args;
-	DWORD	rc;
+	Args args;
+	if (!args.p || args.n <= 1)
+		return E_ARGS;
 
-	if (args.n > 1) {
-		if (!wcscmp(args.p[1], L"install")) {
-			return schedule(true);
-		} else if (!wcscmp(args.p[1], L"uninstall")) {
-			return schedule(false);
-		} else if (!wcscmp(args.p[1], L"request")) {
-			if (args.n > 2) {
-				if (args.n > 3) {
-					wstring cmdline = L"\"";
-					cmdline.append(args.p[3]);
-					cmdline.append(L"\"");
-					for (int i = 4; i < args.n; i++) {
-						cmdline.append(L" ");
-						cmdline.append(args.p[i]);
-					}
-					if (schedule_cb(true, cmdline))
-						logError(L"schedule callback");
-				} else {
-					rc = schedule_cb(false, L"");
-				}
-				return send_request(args.p[2]);
-			} else {
+	if (!wcscmp(args.p[1], L"install")) {
+		if (!IsUserAdmin())
+			return E_PRIVILEGE;
+		const std::wstring hostDir = getStagingHostDir();
+		DWORD dirRc = ensureLockedSystemDirectory(hostDir);
+		if (dirRc != 0) {
+			logError(L"Failed to lock staging directory during install");
+			return dirRc;
+		}
+		return schedule(true);
+	}
+	else if (!wcscmp(args.p[1], L"uninstall")) {
+		if (!IsUserAdmin())
+			return E_PRIVILEGE;
+		const std::wstring hostDir = getStagingHostDir();
+		if (ensureLockedSystemDirectory(hostDir) == 0) {
+			purgeStagingDirectory(hostDir);
+			RemoveDirectoryW(hostDir.c_str());
+		}
+		schedule_cb(false, L"");
+		return schedule(false);
+	}
+	else if (!wcscmp(args.p[1], L"verify-test")) {
+		// Unprivileged read-only signature self-test helper: UpdateElevate.exe verify-test <pkg> <sig>
+		if (args.n != 4)
+			return E_ARGS;
+		std::vector<BYTE> sig;
+		DWORD sigRc = readSignatureFile(args.p[3], sig);
+		if (sigRc != 0)
+			return sigRc;
+		HANDLE hPkg = CreateFileW(
+			args.p[2],
+			GENERIC_READ,
+			FILE_SHARE_READ,
+			NULL,
+			OPEN_EXISTING,
+			FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN,
+			NULL);
+		if (hPkg == INVALID_HANDLE_VALUE)
+			return E_FILES_MISSING;
+		DWORD verRc = verifyFileRSASignature(hPkg, sig);
+		CloseHandle(hPkg);
+		return verRc;
+	}
+	else if (!wcscmp(args.p[1], L"request")) {
+		if (args.n <= 2)
+			return E_ARGS;
+
+		std::wstring normalizedPkgDir;
+		if (!normalizeDirectoryArg(args.p[2], normalizedPkgDir))
+			return E_ARGS;
+
+		if (args.n > 3) {
+			std::wstring allowedExe;
+			if (!resolveAllowedCallbackExecutable(args.p[3], allowedExe)) {
+				logError(L"Rejected untrusted callback path");
 				return E_ARGS;
 			}
-		} else if (!wcscmp(args.p[1], L"trigger") || !wcscmp(args.p[1], L"trigger-run")) {
-			if (!IsUserAdmin()) {
-				logError(L"Missing privileges");
-				return E_PRIVILEGE;
-			}
+			if (schedule_cb(true, allowedExe))
+				logError(L"schedule callback");
+		} else {
+			schedule_cb(false, L"");
+		}
+		return send_request(normalizedPkgDir.c_str());
+	}
+	else if (!wcscmp(args.p[1], L"trigger") || !wcscmp(args.p[1], L"trigger-run")) {
+		if (!IsUserAdmin()) {
+			logError(L"Missing privileges");
+			return E_PRIVILEGE;
+		}
 
-			if (args.n <= 2) {
-				logError(L"Missing path argument");
-				return E_ARGS;
-			}
-			wstring wd = args.p[2];
-			if (wd[wd.length() - 1] != '\\')
-				wd.append(L"\\");
-			wstring pkgname = wd + FULLID EXT;
-			wstring signame = wd + FULLID EXT L".sig";
-			wstring hostDir = HOSTPATH FULLID;
+		if (args.n != 3) {
+			logError(L"Invalid path argument count");
+			return E_ARGS;
+		}
 
-			if (!(FileExists(pkgname.c_str()) && FileExists(signame.c_str()))) {
-				logError(L"Files missing");
+		std::wstring cleanWd;
+		if (!normalizeDirectoryArg(args.p[2], cleanWd)) {
+			logError(L"Invalid package directory argument");
+			return E_REPARSE_OR_PATH;
+		}
+
+		const std::wstring pkgname = cleanWd + L"\\" FULLID EXT;
+		const std::wstring signame = cleanWd + L"\\" FULLID EXT L".sig";
+		const std::wstring hostDir = getStagingHostDir();
+
+		DWORD dirRc = ensureLockedSystemDirectory(hostDir);
+		if (dirRc != 0) {
+			logError(L"Secure staging directory verification failed");
+			return dirRc;
+		}
+
+		if (!wcscmp(args.p[1], L"trigger")) {
+			logMessage(L"Triggered");
+
+			// Quick existence check on source files (without following symlinks)
+			DWORD pkgAttr = GetFileAttributesW(pkgname.c_str());
+			DWORD sigAttr = GetFileAttributesW(signame.c_str());
+			if (pkgAttr == INVALID_FILE_ATTRIBUTES || sigAttr == INVALID_FILE_ATTRIBUTES ||
+				(pkgAttr & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
+				(sigAttr & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0)
+			{
+				logError(L"Source update files missing or invalid");
 				return E_FILES_MISSING;
 			}
 
-			if (!wcscmp(args.p[1], L"trigger")) {
-				logMessage(L"Triggered");
+			std::wstring selfExe, selfDir;
+			if (!getCurrentExecutablePath(selfExe, selfDir)) {
+				logError(L"Failed to resolve own path");
+				return E_STAGE_FAIL;
+			}
 
-				HMODULE hModule = GetModuleHandleW(NULL);
-				WCHAR executablePath[MAX_PATH];
-				GetModuleFileName(hModule, executablePath, MAX_PATH);
+			purgeStagingDirectory(hostDir);
 
-				wstring executableDir(executablePath);
-				executableDir.erase(executableDir.find_last_of('\\') + 1, string::npos);
+			const std::wstring stagedHostExe = hostDir + L"\\UpdateElevate.exe";
+			if (!CopyFileW(selfExe.c_str(), stagedHostExe.c_str(), FALSE)) {
+				logError(L"Failed to stage UpdateElevate host binary");
+				return GetLastError();
+			}
 
-				rc = CreateDirectory(hostDir.c_str(), NULL);
-				if (!rc) {
-					if (GetLastError() != ERROR_ALREADY_EXISTS) {
-						logError(L"Host dir creation failure");
-						return GetLastError();
-					}
-				}
-				rc = prepFile(hostDir);
-				if (rc) {
-					logError(L"Host dir prep failure");
-					return rc;
-				}
+			std::wstring cmdline = quoteCommandLineArg(stagedHostExe) + L" trigger-run " + quoteCommandLineArg(cleanWd);
+			std::vector<wchar_t> cmdvec(cmdline.begin(), cmdline.end());
+			cmdvec.push_back(L'\0');
 
-				for (const WCHAR* fileName : {L"UpdateElevate.exe", L"libssl-3-x64.dll", L"libcrypto-3-x64.dll" , L"vcruntime140.dll", L"msvcp140.dll" }) {
-					rc = copyAndPrepFile(executableDir + fileName, hostDir + L"\\" + fileName);
-					if (rc) {
-						logError(L"Host file prep failure");
-						return rc;
-					}
-				}
+			PROCESS_INFORMATION procInfo = {};
+			STARTUPINFOW startInfo = {};
+			startInfo.cb = sizeof(startInfo);
 
-				PROCESS_INFORMATION procInfo;
-				STARTUPINFO startInfo;
-				ZeroMemory(&startInfo, sizeof(startInfo));
-				startInfo.cb = 0;
-				wstring hostPath = hostDir + L"\\UpdateElevate.exe";
-				wstring cmdline = hostPath + L" trigger-run " + wd;
-				std::vector<wchar_t> cmdvec(cmdline.begin(), cmdline.end());
-				cmdvec.push_back(L'\0');
-				rc = CreateProcess(hostPath.c_str(),
-					cmdvec.data(),
-					NULL,
-					NULL,
-					false,
-					0,
-					NULL,
-					NULL,
-					&startInfo,
-					&procInfo);
-				if (!rc) {
-					logError(L"Run host failure");
-					return GetLastError();
-				}
+			if (!CreateProcessW(
+				stagedHostExe.c_str(),
+				cmdvec.data(),
+				NULL,
+				NULL,
+				FALSE,
+				CREATE_NO_WINDOW,
+				NULL,
+				hostDir.c_str(),
+				&startInfo,
+				&procInfo))
+			{
+				logError(L"Run staged host failure");
+				return GetLastError();
+			}
 
-				CloseHandle(procInfo.hThread);
-				CloseHandle(procInfo.hProcess);
-			} else { // == "trigger-run"
-				logMessage(L"Triggered to run");
+			CloseHandle(procInfo.hThread);
+			CloseHandle(procInfo.hProcess);
+			return 0;
+		}
+		else { // "trigger-run"
+			logMessage(L"Triggered to run");
 
-				DWORD rc = prepFile(pkgname);
-				if (rc) {
-					logError(L"Prep failure");
-					return rc;
-				}
+			std::wstring selfExe, selfDir;
+			if (!getCurrentExecutablePath(selfExe, selfDir))
+				return E_STAGE_FAIL;
 
-				std::ifstream file(pkgname, std::ios::binary | std::ios::ate);
-				std::streamsize size = file.tellg();
-				file.seekg(0, std::ios::beg);
-				std::vector<char> buffer(size);
-				if (!file.read(buffer.data(), size)) {
-					logError(L"File read failure");
-					return 1;
-				}
-				file.close();
+			std::wstring expectedHostPrefix = hostDir + L"\\";
+			if (selfExe.size() <= expectedHostPrefix.size() ||
+				CompareStringOrdinal(selfExe.c_str(), static_cast<int>(expectedHostPrefix.size()), expectedHostPrefix.c_str(), static_cast<int>(expectedHostPrefix.size()), TRUE) != CSTR_EQUAL)
+			{
+				logError(L"trigger-run must execute from secure staging directory");
+				return E_PRIVILEGE;
+			}
 
-				std::ifstream sigfile(signame, std::ios::binary | std::ios::ate);
-				std::streamsize sigsize = sigfile.tellg();
-				sigfile.seekg(0, std::ios::beg);
-				std::vector<char> sigbuffer(sigsize);
-				if (!sigfile.read(sigbuffer.data(), sigsize)) {
-					logError(L"Sig read failure");
-					return 1;
-				}
-				sigfile.close();
+			std::vector<BYTE> sigbuffer;
+			DWORD rc = readSignatureFile(signame, sigbuffer);
+			if (rc != 0) {
+				logError(L"Sig read failure");
+				return rc;
+			}
 
-				rc = verifyRSASignature((unsigned char*)buffer.data(), size, (unsigned char*)sigbuffer.data(), (unsigned int)sigsize);
-				if (rc == E_SIG_FAIL) {
-					logError(L"Invalid signature");
-					return E_SIG_FAIL;
-				} else if (rc) {
-					logError(L"Verification error");
-					return rc;
-				}
+			const std::wstring stagedPkg = hostDir + L"\\VerifiedInstaller" EXT;
+			rc = stageCandidateFile(pkgname, stagedPkg);
+			if (rc != 0) {
+				logError(L"Candidate staging failure");
+				return rc;
+			}
 
-				// The file has a valid signature and cannot be modified by non-admins
-				wstring cmdline = pkgname + L" " + ARGS;
-				std::vector<wchar_t> cmdvec(cmdline.begin(), cmdline.end());
-				cmdvec.push_back(L'\0');
+			// Hold a read-only handle sharing READ|DELETE (denying FILE_SHARE_WRITE) throughout verification + CreateProcessW.
+			HANDLE hLockedPkg = CreateFileW(
+				stagedPkg.c_str(),
+				GENERIC_READ,
+				FILE_SHARE_READ | FILE_SHARE_DELETE,
+				NULL,
+				OPEN_EXISTING,
+				FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN,
+				NULL);
+			if (hLockedPkg == INVALID_HANDLE_VALUE) {
+				DeleteFileW(stagedPkg.c_str());
+				logError(L"Failed to lock staged package");
+				return E_STAGE_FAIL;
+			}
 
-				wstring logmsg = L"Signature verified, executing ";
-				logmsg.append(cmdline);
-				logMessage(logmsg.c_str());
+			rc = verifyFileRSASignature(hLockedPkg, sigbuffer);
+			if (rc != 0) {
+				CloseHandle(hLockedPkg);
+				DeleteFileW(stagedPkg.c_str());
+				logError(rc == E_SIG_FAIL ? L"Invalid signature" : L"Verification error");
+				return rc;
+			}
 
-				PROCESS_INFORMATION procInfo;
-				STARTUPINFO startInfo;
-				ZeroMemory(&startInfo, sizeof(startInfo));
-				startInfo.cb = 0;
+			std::wstring cmdline = quoteCommandLineArg(stagedPkg) + L" " + ARGS;
+			std::vector<wchar_t> cmdvec(cmdline.begin(), cmdline.end());
+			cmdvec.push_back(L'\0');
 
-				rc = CreateProcess(NULL,
-					cmdvec.data(),
-					NULL,
-					NULL,
-					false,
-					0,
-					NULL,
-					NULL,
-					&startInfo,
-					&procInfo);
-				if (!rc) {
-					logError(L"Run failure");
-					return GetLastError();
-				}
+			std::wstring logmsg = L"Signature verified, executing " + cmdline;
+			logMessage(logmsg.c_str());
 
-				rc = WaitForSingleObject(procInfo.hProcess, INFINITE);
-				if (rc != WAIT_OBJECT_0)
-					return rc;
+			PROCESS_INFORMATION procInfo = {};
+			STARTUPINFOW startInfo = {};
+			startInfo.cb = sizeof(startInfo);
 
-				rc = -1;
-				GetExitCodeProcess(procInfo.hProcess, &rc);
+			BOOL created = CreateProcessW(
+				stagedPkg.c_str(),
+				cmdvec.data(),
+				NULL,
+				NULL,
+				FALSE,
+				0,
+				NULL,
+				hostDir.c_str(),
+				&startInfo,
+				&procInfo);
 
-				wstring msg = L"Completed with exit code ";
-				msg.append(to_wstring(rc));
+			if (!created) {
+				DWORD err = GetLastError();
+				CloseHandle(hLockedPkg);
+				DeleteFileW(stagedPkg.c_str());
+				logError(L"Run failure");
+				return err;
+			}
+
+			DWORD waitRc = WaitForSingleObject(procInfo.hProcess, INFINITE);
+			DWORD exitCode = static_cast<DWORD>(-1);
+			if (waitRc == WAIT_OBJECT_0) {
+				GetExitCodeProcess(procInfo.hProcess, &exitCode);
+				std::wstring msg = L"Completed with exit code " + std::to_wstring(exitCode);
 				logMessage(msg.c_str());
 				send_completed();
-
-				CloseHandle(procInfo.hThread);
-				CloseHandle(procInfo.hProcess);
-
-				rc = DeleteFile(pkgname.c_str());
-				rc = DeleteFile(signame.c_str());
-
-				// Lastly, delete self via batch
-				ZeroMemory(&startInfo, sizeof(startInfo));
-				startInfo.cb = 0;
-				cmdline = L"cmd.exe /C TIMEOUT 5 && rmdir /S /Q " + hostDir;
-				cmdvec.assign(cmdline.begin(), cmdline.end());
-				cmdvec.push_back(L'\0');
-				rc = CreateProcess(L"C:\\Windows\\system32\\cmd.exe",
-					cmdvec.data(),
-					NULL,
-					NULL,
-					false,
-					CREATE_NO_WINDOW,
-					NULL,
-					NULL,
-					&startInfo,
-					&procInfo);
 			}
-		} else if (!wcscmp(args.p[1], L"completed")) {
-			schedule_cb(false, L"");
 
-			if (args.n > 2) {
-				wstring cmdline = L"\"";
-				cmdline.append(args.p[2]);
-				cmdline.append(L"\"");
-				for (int i = 3; i < args.n; i++) {
-					cmdline.append(L" ");
-					cmdline.append(args.p[i]);
-				}
-				std::vector<wchar_t> cmdvec(cmdline.begin(), cmdline.end());
-				cmdvec.push_back(L'\0');
+			CloseHandle(procInfo.hThread);
+			CloseHandle(procInfo.hProcess);
+			CloseHandle(hLockedPkg);
 
-				PROCESS_INFORMATION procInfo;
-				STARTUPINFO startInfo;
-				ZeroMemory(&startInfo, sizeof(startInfo));
-				startInfo.cb = 0;
+			DeleteFileW(stagedPkg.c_str());
+			safeDeleteRegularFile(pkgname);
+			safeDeleteRegularFile(signame);
 
-				DWORD rc = CreateProcess(NULL,
-					&cmdvec[0],
-					NULL,
-					NULL,
-					false,
-					0,
-					NULL,
-					NULL,
-					&startInfo,
-					&procInfo);
-				if (!rc) {
-					logError(L"Run failure");
-					return GetLastError();
-				}
-			} else {
+			// Schedule staged UpdateElevate.exe for clean removal on next reboot without spawning cmd.exe.
+			MoveFileExW(selfExe.c_str(), NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+			return (waitRc == WAIT_OBJECT_0) ? 0 : waitRc;
+		}
+	}
+	else if (!wcscmp(args.p[1], L"completed")) {
+		schedule_cb(false, L"");
+
+		if (args.n > 2) {
+			std::wstring allowedExe;
+			if (!resolveAllowedCallbackExecutable(args.p[2], allowedExe)) {
+				logError(L"Rejected untrusted completion executable");
 				return E_ARGS;
 			}
-		} else {
-			return E_ARGS;
+
+			std::wstring cmdline = quoteCommandLineArg(allowedExe);
+			std::vector<wchar_t> cmdvec(cmdline.begin(), cmdline.end());
+			cmdvec.push_back(L'\0');
+
+			std::wstring workDir = allowedExe.substr(0, allowedExe.find_last_of(L"\\/") + 1);
+
+			PROCESS_INFORMATION procInfo = {};
+			STARTUPINFOW startInfo = {};
+			startInfo.cb = sizeof(startInfo);
+
+			if (!CreateProcessW(
+				allowedExe.c_str(),
+				cmdvec.data(),
+				NULL,
+				NULL,
+				FALSE,
+				0,
+				NULL,
+				workDir.c_str(),
+				&startInfo,
+				&procInfo))
+			{
+				logError(L"Completion launch failure");
+				return GetLastError();
+			}
+			CloseHandle(procInfo.hThread);
+			CloseHandle(procInfo.hProcess);
+			return 0;
 		}
-	} else {
 		return E_ARGS;
 	}
 
-	return 0;
+	return E_ARGS;
 }
