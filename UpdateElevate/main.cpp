@@ -22,6 +22,7 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "version.lib")
 
 #define E_ARGS 1000
 #define E_FILES_MISSING 1001
@@ -29,6 +30,7 @@
 #define E_PRIVILEGE 1003
 #define E_REPARSE_OR_PATH 1004
 #define E_STAGE_FAIL 1005
+#define E_DOWNGRADE 1006
 
 static constexpr LONGLONG kMaxPackageBytes = 512LL * 1024 * 1024; // 512 MiB cap
 static constexpr LONGLONG kMinSigBytes = 64;
@@ -277,7 +279,91 @@ static DWORD ensureLockedSystemDirectory(const std::wstring& dirPath) {
 	return rc;
 }
 
-static DWORD purgeStagingDirectory(const std::wstring& dirPath) {
+static bool isTrustedAdminOrSystemOwnedDir(const std::wstring& dirPath) {
+	HANDLE hDir = CreateFileW(
+		dirPath.c_str(),
+		READ_CONTROL | FILE_READ_ATTRIBUTES,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		NULL,
+		OPEN_EXISTING,
+		FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+		NULL);
+	if (hDir == INVALID_HANDLE_VALUE)
+		return false;
+
+	BY_HANDLE_FILE_INFORMATION info = {};
+	bool trusted = false;
+	if (GetFileInformationByHandle(hDir, &info) &&
+		(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
+		(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0)
+	{
+		PSID pOwner = NULL;
+		PSECURITY_DESCRIPTOR pSD = NULL;
+		if (GetSecurityInfo(hDir, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &pOwner, NULL, NULL, NULL, &pSD) == ERROR_SUCCESS && pOwner) {
+			trusted = IsWellKnownSid(pOwner, WinBuiltinAdministratorsSid) || IsWellKnownSid(pOwner, WinLocalSystemSid);
+		}
+		if (pSD)
+			LocalFree(pSD);
+	}
+	CloseHandle(hDir);
+	return trusted;
+}
+
+static bool isRunSubdirName(const wchar_t* name) {
+	if (!name || wcsncmp(name, L"run_", 4) != 0)
+		return false;
+	size_t len = wcslen(name);
+	if (len != 36)
+		return false;
+	for (size_t i = 4; i < 36; ++i) {
+		const wchar_t ch = name[i];
+		if (!((ch >= L'0' && ch <= L'9') || (ch >= L'a' && ch <= L'f') || (ch >= L'A' && ch <= L'F')))
+			return false;
+	}
+	return true;
+}
+
+static bool createExclusiveRunDirectory(const std::wstring& hostDir, std::wstring& outRunDir) {
+	BYTE rnd[16] = {};
+	if (BCryptGenRandom(NULL, rnd, sizeof(rnd), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
+		return false;
+
+	static const wchar_t kHex[] = L"0123456789abcdef";
+	std::wstring hex(32, L'0');
+	for (size_t i = 0; i < 16; ++i) {
+		hex[i * 2] = kHex[(rnd[i] >> 4) & 0x0F];
+		hex[i * 2 + 1] = kHex[rnd[i] & 0x0F];
+	}
+
+	PSECURITY_DESCRIPTOR pSD = NULL;
+	if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+		L"D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+		SDDL_REVISION_1,
+		&pSD,
+		NULL))
+	{
+		return false;
+	}
+
+	SECURITY_ATTRIBUTES sa = {};
+	sa.nLength = sizeof(sa);
+	sa.lpSecurityDescriptor = pSD;
+	sa.bInheritHandle = FALSE;
+
+	const std::wstring candidate = hostDir + L"\\run_" + hex;
+	SetLastError(0);
+	const BOOL created = CreateDirectoryW(candidate.c_str(), &sa);
+	const DWORD err = GetLastError();
+	LocalFree(pSD);
+
+	if (!created || err == ERROR_ALREADY_EXISTS)
+		return false;
+
+	outRunDir = candidate;
+	return true;
+}
+
+static DWORD purgeStagingDirectory(const std::wstring& dirPath, bool allowActiveTrustedRunDirs = false) {
 	std::wstring pattern = dirPath + L"\\*";
 	WIN32_FIND_DATAW fd = {};
 	HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
@@ -293,10 +379,11 @@ static DWORD purgeStagingDirectory(const std::wstring& dirPath) {
 
 		std::wstring itemPath = dirPath + L"\\" + fd.cFileName;
 		if ((fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-			if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
-				RemoveDirectoryW(itemPath.c_str());
-			else
-				DeleteFileW(itemPath.c_str());
+			BOOL removed = ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+				? RemoveDirectoryW(itemPath.c_str())
+				: DeleteFileW(itemPath.c_str());
+			if (!removed && result == 0)
+				result = GetLastError();
 			continue;
 		}
 
@@ -304,11 +391,19 @@ static DWORD purgeStagingDirectory(const std::wstring& dirPath) {
 			SetFileAttributesW(itemPath.c_str(), FILE_ATTRIBUTE_NORMAL);
 
 		if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
-			DWORD subRc = purgeStagingDirectory(itemPath);
-			if (subRc != 0 && result == 0)
-				result = subRc;
-			if (!RemoveDirectoryW(itemPath.c_str()) && result == 0)
-				result = GetLastError();
+			DWORD subRc = purgeStagingDirectory(itemPath, false);
+			BOOL removedDir = RemoveDirectoryW(itemPath.c_str());
+			DWORD rmErr = removedDir ? 0 : GetLastError();
+			if (subRc != 0 || !removedDir) {
+				const DWORD failCode = (subRc != 0) ? subRc : rmErr;
+				const bool isActiveTrustedSelfUpdate =
+					allowActiveTrustedRunDirs &&
+					isRunSubdirName(fd.cFileName) &&
+					isTrustedAdminOrSystemOwnedDir(itemPath) &&
+					(failCode == ERROR_ACCESS_DENIED || failCode == ERROR_SHARING_VIOLATION || failCode == ERROR_DIR_NOT_EMPTY);
+				if (!isActiveTrustedSelfUpdate && result == 0)
+					result = failCode;
+			}
 		} else {
 			if (!DeleteFileW(itemPath.c_str()) && result == 0)
 				result = GetLastError();
@@ -408,7 +503,7 @@ static DWORD stageCandidateFile(const std::wstring& srcPkgPath, const std::wstri
 		GENERIC_WRITE,
 		0, // Exclusive lock while staging
 		NULL,
-		CREATE_ALWAYS,
+		CREATE_NEW, // Never overwrite an existing file with a potentially retained handle
 		FILE_ATTRIBUTE_NORMAL,
 		NULL);
 	if (hDst == INVALID_HANDLE_VALUE) {
@@ -607,6 +702,101 @@ static bool resolveAllowedCallbackExecutable(const std::wstring& requestedPath, 
 	return true;
 }
 
+static bool isDirectoryNotReparsePoint(std::wstring dirPath) {
+	while (dirPath.size() > 3 && (dirPath.back() == L'\\' || dirPath.back() == L'/'))
+		dirPath.pop_back();
+	HANDLE hDir = CreateFileW(
+		dirPath.c_str(),
+		FILE_READ_ATTRIBUTES,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		NULL,
+		OPEN_EXISTING,
+		FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+		NULL);
+	if (hDir == INVALID_HANDLE_VALUE)
+		return false;
+	BY_HANDLE_FILE_INFORMATION info = {};
+	bool ok = GetFileInformationByHandle(hDir, &info) &&
+		(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
+		(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
+	CloseHandle(hDir);
+	return ok;
+}
+
+static bool getPeFileVersion64(const std::wstring& filePath, ULONGLONG& outVersion) {
+	outVersion = 0;
+	// Open without following reparse points and deny writes while reading version resources.
+	HANDLE hGuard = CreateFileW(
+		filePath.c_str(),
+		GENERIC_READ,
+		FILE_SHARE_READ | FILE_SHARE_DELETE,
+		NULL,
+		OPEN_EXISTING,
+		FILE_FLAG_OPEN_REPARSE_POINT,
+		NULL);
+	if (hGuard == INVALID_HANDLE_VALUE)
+		return false;
+
+	BY_HANDLE_FILE_INFORMATION info = {};
+	if (!GetFileInformationByHandle(hGuard, &info) ||
+		(info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0)
+	{
+		CloseHandle(hGuard);
+		return false;
+	}
+
+	DWORD verHandle = 0;
+	DWORD verSize = GetFileVersionInfoSizeW(filePath.c_str(), &verHandle);
+	if (verSize == 0 || verSize > 1024 * 1024) {
+		CloseHandle(hGuard);
+		return false;
+	}
+
+	std::vector<BYTE> verData(verSize);
+	if (!GetFileVersionInfoW(filePath.c_str(), 0, verSize, verData.data())) {
+		CloseHandle(hGuard);
+		return false;
+	}
+
+	VS_FIXEDFILEINFO* pFileInfo = NULL;
+	UINT fiLen = 0;
+	bool ok = false;
+	if (VerQueryValueW(verData.data(), L"\\", reinterpret_cast<LPVOID*>(&pFileInfo), &fiLen) &&
+		pFileInfo &&
+		fiLen >= sizeof(VS_FIXEDFILEINFO) &&
+		pFileInfo->dwSignature == 0xFEEF04BD)
+	{
+		ULONGLONG v = (static_cast<ULONGLONG>(pFileInfo->dwFileVersionMS) << 32) |
+			static_cast<ULONGLONG>(pFileInfo->dwFileVersionLS);
+		if (v != 0) {
+			outVersion = v;
+			ok = true;
+		}
+	}
+
+	CloseHandle(hGuard);
+	return ok;
+}
+
+static bool parseStrictUint64(const wchar_t* str, ULONGLONG& outVal) {
+	outVal = 0;
+	if (!str || *str == L'\0')
+		return false;
+	ULONGLONG acc = 0;
+	for (const wchar_t* p = str; *p != L'\0'; ++p) {
+		if (*p < L'0' || *p > L'9')
+			return false;
+		const ULONGLONG digit = static_cast<ULONGLONG>(*p - L'0');
+		if (acc > (MAXULONGLONG - digit) / 10ULL)
+			return false;
+		acc = acc * 10ULL + digit;
+	}
+	if (acc == 0)
+		return false;
+	outVal = acc;
+	return true;
+}
+
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, int iCmdShow) {
 	UNREFERENCED_PARAMETER(hInstance);
 	UNREFERENCED_PARAMETER(hpInstance);
@@ -630,11 +820,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 	if (!wcscmp(args.p[1], L"install")) {
 		if (!IsUserAdmin())
 			return E_PRIVILEGE;
+		std::wstring selfExe, selfDir;
+		if (!getCurrentExecutablePath(selfExe, selfDir) || !isDirectoryNotReparsePoint(selfDir)) {
+			logError(L"Refusing install from reparse point or invalid directory");
+			return E_REPARSE_OR_PATH;
+		}
 		const std::wstring hostDir = getStagingHostDir();
 		DWORD dirRc = ensureLockedSystemDirectory(hostDir);
 		if (dirRc != 0) {
 			logError(L"Failed to lock staging directory during install");
 			return dirRc;
+		}
+		DWORD purgeRc = purgeStagingDirectory(hostDir, true);
+		if (purgeRc != 0) {
+			logError(L"Failed to purge pre-existing staging directory contents during install");
+			return E_STAGE_FAIL;
 		}
 		return schedule(true);
 	}
@@ -650,8 +850,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 		return schedule(false);
 	}
 	else if (!wcscmp(args.p[1], L"verify-test")) {
-		// Unprivileged read-only signature self-test helper: UpdateElevate.exe verify-test <pkg> <sig>
-		if (args.n != 4)
+		// Unprivileged read-only signature & version self-test helper: UpdateElevate.exe verify-test <pkg> <sig> [installedExe]
+		if (args.n != 4 && args.n != 5)
 			return E_ARGS;
 		std::vector<BYTE> sig;
 		DWORD sigRc = readSignatureFile(args.p[3], sig);
@@ -660,7 +860,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 		HANDLE hPkg = CreateFileW(
 			args.p[2],
 			GENERIC_READ,
-			FILE_SHARE_READ,
+			FILE_SHARE_READ | FILE_SHARE_DELETE,
 			NULL,
 			OPEN_EXISTING,
 			FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN,
@@ -668,6 +868,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 		if (hPkg == INVALID_HANDLE_VALUE)
 			return E_FILES_MISSING;
 		DWORD verRc = verifyFileRSASignature(hPkg, sig);
+		if (verRc == 0 && args.n == 5) {
+			ULONGLONG instVer = 0, candVer = 0;
+			if (!getPeFileVersion64(args.p[4], instVer) || !getPeFileVersion64(args.p[2], candVer) || candVer <= instVer)
+				verRc = E_DOWNGRADE;
+		}
 		CloseHandle(hPkg);
 		return verRc;
 	}
@@ -698,7 +903,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 			return E_PRIVILEGE;
 		}
 
-		if (args.n != 3) {
+		const bool isTriggerStage = !wcscmp(args.p[1], L"trigger");
+		if ((isTriggerStage && args.n != 3) || (!isTriggerStage && args.n != 4)) {
 			logError(L"Invalid path argument count");
 			return E_ARGS;
 		}
@@ -719,7 +925,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 			return dirRc;
 		}
 
-		if (!wcscmp(args.p[1], L"trigger")) {
+		if (isTriggerStage) {
 			logMessage(L"Triggered");
 
 			// Quick existence check on source files (without following symlinks)
@@ -734,20 +940,38 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 			}
 
 			std::wstring selfExe, selfDir;
-			if (!getCurrentExecutablePath(selfExe, selfDir)) {
+			if (!getCurrentExecutablePath(selfExe, selfDir) || !isDirectoryNotReparsePoint(selfDir)) {
 				logError(L"Failed to resolve own path");
 				return E_STAGE_FAIL;
 			}
 
-			purgeStagingDirectory(hostDir);
-
-			const std::wstring stagedHostExe = hostDir + L"\\UpdateElevate.exe";
-			if (!CopyFileW(selfExe.c_str(), stagedHostExe.c_str(), FALSE)) {
-				logError(L"Failed to stage UpdateElevate host binary");
-				return GetLastError();
+			ULONGLONG installedVer = 0;
+			const std::wstring installedAppExe = selfDir + NAME EXT;
+			if (!getPeFileVersion64(installedAppExe, installedVer)) {
+				logError(L"Failed to read installed application version");
+				return E_STAGE_FAIL;
 			}
 
-			std::wstring cmdline = quoteCommandLineArg(stagedHostExe) + L" trigger-run " + quoteCommandLineArg(cleanWd);
+			if (purgeStagingDirectory(hostDir, true) != 0) {
+				logError(L"Failed to purge staging directory before update");
+				return E_STAGE_FAIL;
+			}
+
+			std::wstring runDir;
+			if (!createExclusiveRunDirectory(hostDir, runDir)) {
+				logError(L"Failed to create exclusive per-run staging directory");
+				return E_STAGE_FAIL;
+			}
+
+			const std::wstring stagedHostExe = runDir + L"\\UpdateElevate.exe";
+			DWORD stageHostRc = stageCandidateFile(selfExe, stagedHostExe);
+			if (stageHostRc != 0) {
+				RemoveDirectoryW(runDir.c_str());
+				logError(L"Failed to stage UpdateElevate host binary exclusively");
+				return stageHostRc;
+			}
+
+			std::wstring cmdline = quoteCommandLineArg(stagedHostExe) + L" trigger-run " + quoteCommandLineArg(cleanWd) + L" " + std::to_wstring(installedVer);
 			std::vector<wchar_t> cmdvec(cmdline.begin(), cmdline.end());
 			cmdvec.push_back(L'\0');
 
@@ -763,10 +987,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 				FALSE,
 				CREATE_NO_WINDOW,
 				NULL,
-				hostDir.c_str(),
+				runDir.c_str(),
 				&startInfo,
 				&procInfo))
 			{
+				DeleteFileW(stagedHostExe.c_str());
+				RemoveDirectoryW(runDir.c_str());
 				logError(L"Run staged host failure");
 				return GetLastError();
 			}
@@ -778,15 +1004,25 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 		else { // "trigger-run"
 			logMessage(L"Triggered to run");
 
+			ULONGLONG installedVer = 0;
+			if (!parseStrictUint64(args.p[3], installedVer)) {
+				logError(L"Invalid installed version argument");
+				return E_ARGS;
+			}
+
 			std::wstring selfExe, selfDir;
-			if (!getCurrentExecutablePath(selfExe, selfDir))
+			if (!getCurrentExecutablePath(selfExe, selfDir) || !isDirectoryNotReparsePoint(selfDir))
 				return E_STAGE_FAIL;
 
-			std::wstring expectedHostPrefix = hostDir + L"\\";
-			if (selfExe.size() <= expectedHostPrefix.size() ||
-				CompareStringOrdinal(selfExe.c_str(), static_cast<int>(expectedHostPrefix.size()), expectedHostPrefix.c_str(), static_cast<int>(expectedHostPrefix.size()), TRUE) != CSTR_EQUAL)
+			std::wstring runDir = selfDir;
+			while (runDir.size() > 3 && (runDir.back() == L'\\' || runDir.back() == L'/'))
+				runDir.pop_back();
+
+			std::wstring expectedRunPrefix = hostDir + L"\\run_";
+			if (runDir.size() <= expectedRunPrefix.size() ||
+				CompareStringOrdinal(runDir.c_str(), static_cast<int>(expectedRunPrefix.size()), expectedRunPrefix.c_str(), static_cast<int>(expectedRunPrefix.size()), TRUE) != CSTR_EQUAL)
 			{
-				logError(L"trigger-run must execute from secure staging directory");
+				logError(L"trigger-run must execute from secure per-run staging directory");
 				return E_PRIVILEGE;
 			}
 
@@ -797,7 +1033,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 				return rc;
 			}
 
-			const std::wstring stagedPkg = hostDir + L"\\VerifiedInstaller" EXT;
+			const std::wstring stagedPkg = runDir + L"\\VerifiedInstaller" EXT;
 			rc = stageCandidateFile(pkgname, stagedPkg);
 			if (rc != 0) {
 				logError(L"Candidate staging failure");
@@ -827,6 +1063,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 				return rc;
 			}
 
+			ULONGLONG candidateVer = 0;
+			if (!getPeFileVersion64(stagedPkg, candidateVer) || candidateVer <= installedVer) {
+				CloseHandle(hLockedPkg);
+				DeleteFileW(stagedPkg.c_str());
+				logError(L"Rejected downgrade or missing candidate installer version");
+				return E_DOWNGRADE;
+			}
+
 			std::wstring cmdline = quoteCommandLineArg(stagedPkg) + L" " + ARGS;
 			std::vector<wchar_t> cmdvec(cmdline.begin(), cmdline.end());
 			cmdvec.push_back(L'\0');
@@ -846,7 +1090,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 				FALSE,
 				0,
 				NULL,
-				hostDir.c_str(),
+				runDir.c_str(),
 				&startInfo,
 				&procInfo);
 
@@ -875,8 +1119,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hpInstance, LPTSTR nCmdLine, 
 			safeDeleteRegularFile(pkgname);
 			safeDeleteRegularFile(signame);
 
-			// Schedule staged UpdateElevate.exe for clean removal on next reboot without spawning cmd.exe.
+			// Schedule staged UpdateElevate.exe and its per-run directory for clean removal on next reboot.
 			MoveFileExW(selfExe.c_str(), NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+			MoveFileExW(runDir.c_str(), NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
 			return (waitRc == WAIT_OBJECT_0) ? 0 : waitRc;
 		}
 	}
