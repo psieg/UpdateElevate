@@ -139,12 +139,61 @@ static bool getCurrentExecutablePath(std::wstring& exePath, std::wstring& exeDir
 	}
 }
 
+static bool isDirectoryNotReparsePoint(std::wstring dirPath) {
+	while (dirPath.size() > 3 && (dirPath.back() == L'\\' || dirPath.back() == L'/'))
+		dirPath.pop_back();
+	HANDLE hDir = CreateFileW(
+		dirPath.c_str(),
+		FILE_READ_ATTRIBUTES,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		NULL,
+		OPEN_EXISTING,
+		FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+		NULL);
+	if (hDir == INVALID_HANDLE_VALUE)
+		return false;
+	BY_HANDLE_FILE_INFORMATION info = {};
+	bool ok = GetFileInformationByHandle(hDir, &info) &&
+		(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
+		(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
+	CloseHandle(hDir);
+	return ok;
+}
+
 static std::wstring getStagingHostDir() {
-	PWSTR pszProgramData = NULL;
+	// Prefer %SystemRoot%\SystemTemp (admin/SYSTEM-only on Win10 22H2+/Win11),
+	// falling back to %ProgramFiles%\Common Files (admin/SYSTEM-only on older Windows).
+	std::vector<wchar_t> winDir(MAX_PATH, L'\0');
+	UINT winLen = GetSystemWindowsDirectoryW(winDir.data(), static_cast<UINT>(winDir.size()));
+	if (winLen >= winDir.size()) {
+		winDir.resize(winLen + 1, L'\0');
+		winLen = GetSystemWindowsDirectoryW(winDir.data(), static_cast<UINT>(winDir.size()));
+	}
+	if (winLen > 0 && winLen < winDir.size()) {
+		std::wstring sysRoot(winDir.data(), winLen);
+		while (!sysRoot.empty() && (sysRoot.back() == L'\\' || sysRoot.back() == L'/'))
+			sysRoot.pop_back();
+		const std::wstring sysTemp = sysRoot + L"\\SystemTemp";
+		if (isDirectoryNotReparsePoint(sysTemp)) {
+			return sysTemp + L"\\" FULLID;
+		}
+	}
+
+	PWSTR pszKnown = NULL;
+	if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramFilesCommon, KF_FLAG_DEFAULT, NULL, &pszKnown)) && pszKnown) {
+		std::wstring commonDir = pszKnown;
+		CoTaskMemFree(pszKnown);
+		while (!commonDir.empty() && (commonDir.back() == L'\\' || commonDir.back() == L'/'))
+			commonDir.pop_back();
+		if (!commonDir.empty() && isDirectoryNotReparsePoint(commonDir)) {
+			return commonDir + L"\\" FULLID;
+		}
+	}
+
 	std::wstring base = L"C:\\ProgramData";
-	if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramData, KF_FLAG_DEFAULT, NULL, &pszProgramData)) && pszProgramData) {
-		base = pszProgramData;
-		CoTaskMemFree(pszProgramData);
+	if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramData, KF_FLAG_DEFAULT, NULL, &pszKnown)) && pszKnown) {
+		base = pszKnown;
+		CoTaskMemFree(pszKnown);
 	}
 	while (!base.empty() && (base.back() == L'\\' || base.back() == L'/'))
 		base.pop_back();
@@ -700,27 +749,6 @@ static bool resolveAllowedCallbackExecutable(const std::wstring& requestedPath, 
 
 	allowedExeOut = expectedExe;
 	return true;
-}
-
-static bool isDirectoryNotReparsePoint(std::wstring dirPath) {
-	while (dirPath.size() > 3 && (dirPath.back() == L'\\' || dirPath.back() == L'/'))
-		dirPath.pop_back();
-	HANDLE hDir = CreateFileW(
-		dirPath.c_str(),
-		FILE_READ_ATTRIBUTES,
-		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-		NULL,
-		OPEN_EXISTING,
-		FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-		NULL);
-	if (hDir == INVALID_HANDLE_VALUE)
-		return false;
-	BY_HANDLE_FILE_INFORMATION info = {};
-	bool ok = GetFileInformationByHandle(hDir, &info) &&
-		(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
-		(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
-	CloseHandle(hDir);
-	return ok;
 }
 
 static bool getPeFileVersion64(const std::wstring& filePath, ULONGLONG& outVersion) {
